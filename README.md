@@ -2,9 +2,98 @@
 
 포켓몬의 이미지와 음성을 함께 사용해 클래스를 분류하는 멀티모달 인식 시스템 프로젝트입니다.  
 프로젝트 성격은 `포켓몬 과제형 프로젝트 + 논문 기반 응용`이며, 초기 단계에서는 논문 데이터셋(SSW60)으로 파이프라인을 검증하고, 이후 포켓몬 전용 데이터셋으로 확장하는 것을 목표로 합니다.
-현재 저장소 기준으로는 `Data/SSW60/processed`, `Engine` 6개 모델 파일, `Config` 기본 설정 파일이 준비되어 있으며, 다음 단계는 GUI 연결과 포켓몬 데이터셋 확장입니다.
+현재 저장소 기준으로는 `scripts/prepare_ssw60_processed.py`, `Engine` 6개 모델 파일, `Config` 기본 설정 파일, 학습 GUI, 파일 테스트 GUI가 준비되어 있으며, `Data`와 `artifacts`는 첫 실행 시 자동 생성됩니다.
 
 기준 논문: `Exploring Fine-Grained Audiovisual Categorization with the SSW60 Dataset`
+
+---
+
+## Quick Guide
+
+처음 클론한 뒤 바로 실행해볼 때의 최소 순서입니다.  
+`Data/`와 `artifacts/`는 Git 추적 대상에서 제외되어 있으며, 아래 과정에서 자동으로 생성됩니다.
+
+### 0. 환경 준비
+
+권장 버전: `Python 3.10+`
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+- `requirements.txt`에는 현재 코드에서 실제로 사용하는 런타임 패키지만 넣어두었습니다.
+- `Config/*.json`의 기본값은 `"device": "cuda"`입니다. GPU가 없으면 학습/추론 전에 `"cpu"`로 바꿔서 실행하세요.
+- CUDA용 PyTorch가 필요하면 `torch`, `torchvision`, `torchaudio`는 PyTorch 공식 설치 가이드에 맞춰 다시 설치하는 편이 안전합니다.
+
+### 1. SSW60 데이터 준비
+
+fresh clone 상태에서는 아래 스크립트를 그대로 실행하면 됩니다.
+
+```powershell
+python scripts\prepare_ssw60_processed.py
+```
+
+이 스크립트는 다음을 수행합니다.
+
+- SSW60 원본 아카이브를 다운로드한다.
+- `Data\SSW60\raw`를 만든다.
+- `Data\SSW60\processed` 표준 구조를 만든다.
+- `train`, `val`, `test` 폴더와 `labels.json`을 생성한다.
+
+이미 raw 데이터나 로컬 아카이브가 있을 때만 `--skip-download` 옵션을 사용하세요.
+
+### 2. 학습 실행
+
+학습 GUI는 아래 명령으로 실행합니다.
+
+```powershell
+python -m Application.trainer_gui.main
+```
+
+기본 흐름:
+
+1. 데이터셋 폴더로 `Data\SSW60\processed`를 선택한다.
+2. 모델을 고른다.
+   `ImageModel`, `AudioModel`, `LateFusionModel`, `MidFusionModel`, `ScoreFusionModel`
+3. `학습 대기열 추가`를 눌러 학습을 시작한다.
+4. 결과는 `artifacts\training_runs\...` 아래에 저장된다.
+
+학습 결과에서 주로 보는 파일:
+
+- `checkpoints\*_best.pt`: 최고 성능 체크포인트
+- `checkpoints\*_last.pt`: 마지막 체크포인트
+- `logs\training_summary.json`
+- `logs\training_history.json`
+- `metrics\test_metrics.json`
+
+### 3. 파일 기반 테스트
+
+파일 테스트 GUI는 아래 명령으로 실행합니다.
+
+```powershell
+python -m Application.file_test_gui.main
+```
+
+기본 흐름:
+
+1. 학습 결과 폴더의 `checkpoints\*_best.pt`를 선택한다.
+2. 모델 종류에 맞는 입력 파일을 고른다.
+   - `ImageModel`: 이미지 파일만 선택
+   - `AudioModel`: 오디오 파일만 선택
+   - 멀티모달 모델 3종: 이미지와 오디오를 모두 선택
+3. `파일 기반 추론 실행`을 누른다.
+4. 결과는 `artifacts\file_test_runs\...` 아래에 저장된다.
+
+가장 쉽게 테스트하는 방법은 `Data\SSW60\processed\test\<label>\<sample_id>\` 안에 있는 `image.png`, `audio.wav`를 그대로 사용하는 것입니다.
+
+파일 테스트 결과에서 주로 보는 파일:
+
+- `predictions\inference_predictions.json`
+- `logs\inference_summary.json`
+- `metrics\inference_metrics.json`
 
 ---
 

@@ -1,0 +1,16 @@
+# Core deep learning
+torch
+torchvision
+torchaudio
+
+# Numerical computing and evaluation
+numpy
+scipy
+scikit-learn
+
+# Image and audio I/O
+Pillow
+soundfile
+
+# Desktop GUI
+PySide6
