@@ -1,0 +1,26 @@
+{
+  "ImageModel": {
+    "model_name": "vit_b_16",
+    "pretrained": true,
+    "pretrained_weights": "IMAGENET1K_V1",
+    "image_size": 224,
+    "resize_size": 256,
+    "batch_size": 32,
+    "num_workers": 8,
+    "learning_rate": 0.00003,
+    "weight_decay": 0.05,
+    "epochs": 30,
+    "dropout": 0.1,
+    "early_stopping_patience": 8,
+    "augmentation": true,
+    "horizontal_flip": true,
+    "rotation_degrees": 15.0,
+    "color_jitter": 0.2,
+    "optimizer": "adamw",
+    "seed": 42,
+    "device": "cuda",
+    "top_k": 5,
+    "best_model_name": "ImageModel_best.pt",
+    "last_model_name": "ImageModel_last.pt"
+  }
+}
