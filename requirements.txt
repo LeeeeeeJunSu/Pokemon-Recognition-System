@@ -11,6 +11,7 @@ scikit-learn
 # Image and audio I/O
 Pillow
 soundfile
+librosa
 
 # Desktop GUI
 PySide6
