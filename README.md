@@ -95,6 +95,23 @@ python -m Application.file_test_gui.main
 - `logs\inference_summary.json`
 - `metrics\inference_metrics.json`
 
+### 4. 실시간 추론 실행
+
+실시간 추론 GUI는 아래 명령으로 실행합니다.
+
+```powershell
+python -m Application.realtime_inference_gui.main
+```
+
+기본 흐름:
+
+1. 학습 GUI가 만든 `artifacts\training_runs\...\checkpoints\*_best.pt` 또는 `*_last.pt`를 선택한다.
+2. 모델 종류가 자동으로 맞춰지지 않으면 직접 선택한다.
+3. 카메라 번호, 추론 간격, 오디오 윈도우 길이를 조정한다.
+4. `실시간 추론 시작`을 누르면 카메라/마이크 입력을 계속 샘플링해 예측, 신뢰도, Top-K 결과를 갱신한다.
+
+실시간 앱은 기존 엔진의 `Load()`와 `Inference()`를 재사용합니다. 따라서 각 추론 tick은 `artifacts\realtime_runs\...` 아래에 `image.png`, `audio.wav`, `predictions\inference_predictions.json` 형태로 저장됩니다.
+
 ---
 
 ## 1. 프로젝트 목적

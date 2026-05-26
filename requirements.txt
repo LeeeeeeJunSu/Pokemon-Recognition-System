@@ -11,6 +11,8 @@ scikit-learn
 # Image and audio I/O
 Pillow
 soundfile
+opencv-python
+sounddevice
 
 # Desktop GUI
 PySide6
