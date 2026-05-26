@@ -17,6 +17,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aiff", ".aif"}
 DEFAULT_SAMPLE_RATE = 22050
 RAW_CLASS_ALIASES = {
     "Farfetchd": ("Farfetch",),
@@ -31,7 +32,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Build the project's paired image/audio dataset layout from the Pokemon raw "
             "images and cries. Train images can be expanded with camera-style "
-            "augmentation for better real-world camera robustness."
+            "augmentation, and train audio can be mixed with background audio for "
+            "better real-world recording robustness."
         )
     )
     parser.add_argument(
@@ -83,6 +85,27 @@ def parse_args() -> argparse.Namespace:
             "Number of deterministic augmented cry files to cache per Pokemon for train samples. "
             "Set 0 to reuse only the original cry."
         ),
+    )
+    parser.add_argument(
+        "--audio-background-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional background audio directory for SNR-based cry/background mixing. "
+            "If omitted, the script uses a background directory under raw root when present."
+        ),
+    )
+    parser.add_argument(
+        "--audio-mix-offset-step",
+        type=float,
+        default=3.0,
+        help="Step size, in seconds, for selecting deterministic background offsets.",
+    )
+    parser.add_argument(
+        "--audio-mix-snr-db",
+        type=float,
+        default=10.0,
+        help="Target SNR in dB when mixing Pokemon cries with background audio.",
     )
     return parser.parse_args()
 
@@ -148,6 +171,30 @@ def collect_image_paths(split_root: Path, class_name: str) -> list[Path]:
         for path in class_dir.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
+
+
+def collect_audio_paths(root: Path | None) -> list[Path]:
+    if root is None or not root.exists():
+        return []
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    )
+
+
+def resolve_audio_background_root(raw_root: Path, requested_root: Path | None) -> Path | None:
+    if requested_root is not None:
+        resolved = requested_root.expanduser().resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Audio background root not found: {resolved}")
+        return resolved
+
+    for name in ("bgm", "BGM", "background", "backgrounds", "Background", "Backgrounds"):
+        candidate = raw_root / name
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def write_labels_json(
@@ -217,6 +264,14 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0)
 
 
+def mix_at_snr(signal: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
+    signal_rms = float(np.sqrt(np.mean(signal**2) + 1e-12))
+    noise_rms = float(np.sqrt(np.mean(noise**2) + 1e-12))
+    target_noise_rms = signal_rms / (10 ** (snr_db / 20.0))
+    mixed = signal + noise * (target_noise_rms / noise_rms)
+    return normalize_audio(mixed)
+
+
 def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -263,17 +318,63 @@ def rng_np_normal(rng: random.Random, length: int, std: float) -> np.ndarray:
     return np.random.default_rng(seed).normal(0.0, std, length).astype(np.float32)
 
 
+def try_mix_with_background(
+    audio: np.ndarray,
+    background_paths: list[Path],
+    background_cache: dict[Path, np.ndarray],
+    sample_rate: int,
+    offset_step_sec: float,
+    snr_db: float,
+    rng: random.Random,
+) -> tuple[np.ndarray, dict[str, Any]] | None:
+    if not background_paths:
+        return None
+
+    candidates = list(background_paths)
+    rng.shuffle(candidates)
+    offset_step_samples = max(1, int(round(max(0.001, offset_step_sec) * sample_rate)))
+
+    for background_path in candidates:
+        if background_path not in background_cache:
+            try:
+                background_cache[background_path], _ = load_audio(background_path, sample_rate)
+            except RuntimeError:
+                continue
+
+        background = background_cache[background_path]
+        if audio.shape[0] > background.shape[0]:
+            continue
+
+        max_start = background.shape[0] - audio.shape[0]
+        offset_count = (max_start // offset_step_samples) + 1
+        offset_index = rng.randrange(offset_count)
+        start = offset_index * offset_step_samples
+        end = start + audio.shape[0]
+        mixed = mix_at_snr(audio, background[start:end], snr_db)
+        return mixed, {
+            "background_path": background_path,
+            "offset_sec": round(start / float(sample_rate), 3),
+            "snr_db": snr_db,
+        }
+
+    return None
+
+
 def prepare_audio_cache(
     raw_root: Path,
     processed_root: Path,
     pokemon_ids: list[int],
     sample_rate: int,
     audio_augment_copies: int,
+    background_paths: list[Path],
+    audio_mix_offset_step: float,
+    audio_mix_snr_db: float,
     rng: random.Random,
 ) -> dict[int, list[dict[str, Any]]]:
     cache_root = processed_root / "_audio_cache"
     cache_root.mkdir(parents=True, exist_ok=True)
     audio_cache: dict[int, list[dict[str, Any]]] = {}
+    background_cache: dict[Path, np.ndarray] = {}
 
     for pokemon_id in pokemon_ids:
         source_path = raw_root / "cry" / f"{pokemon_id}.ogg"
@@ -295,15 +396,30 @@ def prepare_audio_cache(
 
         for index in range(audio_augment_copies):
             augmented_path = cache_root / f"{pokemon_id:03d}_aug_{index:02d}.wav"
-            augmented = augment_audio(audio, rng)
-            write_wav(augmented_path, augmented, sample_rate)
-            variants.append(
-                {
-                    "path": augmented_path,
-                    "augmentation": "gain_shift_noise_speed",
-                    "source_path": source_path,
-                }
+            background_mix = try_mix_with_background(
+                audio=audio,
+                background_paths=background_paths,
+                background_cache=background_cache,
+                sample_rate=sample_rate,
+                offset_step_sec=audio_mix_offset_step,
+                snr_db=audio_mix_snr_db,
+                rng=rng,
             )
+            augmentation = "background_mix"
+            details: dict[str, Any] = {}
+            if background_mix is None:
+                augmented = augment_audio(audio, rng)
+                augmentation = "gain_shift_noise_speed"
+            else:
+                augmented, details = background_mix
+            write_wav(augmented_path, augmented, sample_rate)
+            variant = {
+                "path": augmented_path,
+                "augmentation": augmentation,
+                "source_path": source_path,
+            }
+            variant.update(details)
+            variants.append(variant)
 
         audio_cache[pokemon_id] = variants
 
@@ -540,7 +656,22 @@ def write_meta(
     image_augmentation: str,
     audio_augmentation: str,
     audio_storage: str,
+    audio_background: Path | None = None,
+    audio_mix_offset_sec: float | None = None,
+    audio_mix_snr_db: float | None = None,
 ) -> None:
+    audio_meta: dict[str, Any] = {
+        "original_path": str(audio_source.as_posix()),
+        "augmentation": audio_augmentation,
+        "storage": audio_storage,
+    }
+    if audio_background is not None:
+        audio_meta["background_path"] = str(audio_background.as_posix())
+    if audio_mix_offset_sec is not None:
+        audio_meta["offset_sec"] = audio_mix_offset_sec
+    if audio_mix_snr_db is not None:
+        audio_meta["snr_db"] = audio_mix_snr_db
+
     meta = {
         "dataset": dataset,
         "split": split,
@@ -552,11 +683,7 @@ def write_meta(
             "original_path": str(image_source.as_posix()),
             "augmentation": image_augmentation,
         },
-        "audio": {
-            "original_path": str(audio_source.as_posix()),
-            "augmentation": audio_augmentation,
-            "storage": audio_storage,
-        },
+        "audio": audio_meta,
     }
     with (sample_dir / "meta.json").open("w", encoding="utf-8") as handle:
         json.dump(meta, handle, ensure_ascii=False, indent=2)
@@ -603,6 +730,13 @@ def create_sample(
         image_augmentation=image_augmentation,
         audio_augmentation=str(audio_variant["augmentation"]),
         audio_storage=audio_storage,
+        audio_background=(
+            Path(audio_variant["background_path"])
+            if "background_path" in audio_variant
+            else None
+        ),
+        audio_mix_offset_sec=audio_variant.get("offset_sec"),
+        audio_mix_snr_db=audio_variant.get("snr_db"),
     )
 
 
@@ -651,17 +785,25 @@ def build_processed_dataset(args: argparse.Namespace) -> Counter:
         (processed_root / split).mkdir(parents=True, exist_ok=True)
 
     label_indices = write_labels_json(processed_root, classes)
+    audio_background_root = resolve_audio_background_root(raw_root, args.audio_background_root)
+    background_paths = collect_audio_paths(audio_background_root)
+    if args.audio_background_root is not None and not background_paths:
+        raise ValueError(f"No background audio files found under: {audio_background_root}")
     audio_cache = prepare_audio_cache(
         raw_root=raw_root,
         processed_root=processed_root,
         pokemon_ids=[pokemon_id for pokemon_id, _ in classes],
         sample_rate=args.sample_rate,
         audio_augment_copies=max(0, args.audio_augment_copies),
+        background_paths=background_paths,
+        audio_mix_offset_step=args.audio_mix_offset_step,
+        audio_mix_snr_db=args.audio_mix_snr_db,
         rng=rng,
     )
 
     summary: Counter = Counter()
     camera_augmentation = not args.disable_camera_augmentation
+    summary["audio_background_files"] = len(background_paths)
 
     for pokemon_id, class_name in classes:
         label_index = label_indices[pokemon_id]

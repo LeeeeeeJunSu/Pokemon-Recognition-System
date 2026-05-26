@@ -13,6 +13,7 @@ Pillow
 soundfile
 opencv-python
 sounddevice
+librosa
 
 # Desktop GUI
 PySide6
