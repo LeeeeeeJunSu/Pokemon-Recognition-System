@@ -31,9 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build the project's paired image/audio dataset layout from the Pokemon raw "
-            "images and cries. Train images can be expanded with camera-style "
-            "augmentation, and train audio can be mixed with background audio for "
-            "better real-world recording robustness."
+            "images and cries. Train images can be expanded with phone-camera-style "
+            "augmentation, and train audio can be mixed with background audio plus "
+            "mild microphone effects for better real-world recording robustness."
         )
     )
     parser.add_argument(
@@ -51,8 +51,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-train-count",
         type=int,
-        default=80,
+        default=200,
         help="Minimum number of train samples to create per class after augmentation.",
+    )
+    parser.add_argument(
+        "--target-val-count",
+        type=int,
+        default=50,
+        help="Minimum number of validation samples to create per class after augmentation.",
+    )
+    parser.add_argument(
+        "--target-test-count",
+        type=int,
+        default=50,
+        help="Minimum number of test samples to create per class after augmentation.",
     )
     parser.add_argument(
         "--val-ratio",
@@ -75,14 +87,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-camera-augmentation",
         action="store_true",
-        help="Use lighter image augmentation instead of camera-style synthetic scenes.",
+        help="Use lighter image augmentation instead of phone-camera-style backgrounds.",
     )
     parser.add_argument(
         "--audio-augment-copies",
         type=int,
         default=4,
         help=(
-            "Number of deterministic augmented cry files to cache per Pokemon for train samples. "
+            "Number of deterministic augmented cry files to cache per Pokemon. "
             "Set 0 to reuse only the original cry."
         ),
     )
@@ -104,8 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio-mix-snr-db",
         type=float,
-        default=10.0,
-        help="Target SNR in dB when mixing Pokemon cries with background audio.",
+        default=16.0,
+        help="Base target SNR in dB when mixing Pokemon cries with background audio.",
     )
     return parser.parse_args()
 
@@ -284,31 +296,85 @@ def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
         wavfile.write(path, sample_rate, (normalize_audio(audio) * 32767).astype(np.int16))
 
 
-def augment_audio(audio: np.ndarray, rng: random.Random) -> np.ndarray:
-    augmented = audio.copy()
+def shift_audio(audio: np.ndarray, shift_samples: int) -> np.ndarray:
+    if shift_samples == 0 or audio.size == 0:
+        return audio.copy()
 
-    gain = rng.uniform(0.75, 1.25)
+    shift_samples = max(-audio.shape[0] + 1, min(audio.shape[0] - 1, shift_samples))
+    if shift_samples == 0:
+        return audio.copy()
+
+    shifted = np.zeros_like(audio)
+    if shift_samples > 0:
+        shifted[shift_samples:] = audio[:-shift_samples]
+    else:
+        shifted[:shift_samples] = audio[-shift_samples:]
+    return shifted
+
+
+def time_stretch_to_length(audio: np.ndarray, speed: float, target_length: int) -> np.ndarray:
+    if audio.shape[0] <= 1 or target_length <= 1:
+        return audio.copy()
+
+    new_length = max(1, int(round(audio.shape[0] / speed)))
+    x_old = np.linspace(0.0, 1.0, num=audio.shape[0], endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=new_length, endpoint=False)
+    stretched = np.interp(x_new, x_old, audio).astype(np.float32)
+    if stretched.shape[0] >= target_length:
+        start = (stretched.shape[0] - target_length) // 2
+        return stretched[start : start + target_length]
+    return np.pad(stretched, (0, target_length - stretched.shape[0]))
+
+
+def apply_room_reflection(audio: np.ndarray, sample_rate: int, rng: random.Random) -> np.ndarray:
+    reflected = audio.copy()
+    for _ in range(rng.randint(1, 2)):
+        delay = int(round(rng.uniform(18.0, 55.0) * sample_rate / 1000.0))
+        if delay <= 0 or delay >= audio.shape[0]:
+            continue
+        reflected[delay:] += audio[:-delay] * rng.uniform(0.05, 0.16)
+    return reflected
+
+
+def apply_soft_bandlimit(audio: np.ndarray) -> np.ndarray:
+    if audio.shape[0] < 3:
+        return audio.copy()
+    kernel = np.array([0.08, 0.84, 0.08], dtype=np.float32)
+    return np.convolve(audio, kernel, mode="same").astype(np.float32)
+
+
+def add_microphone_noise(audio: np.ndarray, rng: random.Random) -> np.ndarray:
+    rms = float(np.sqrt(np.mean(audio**2) + 1e-12))
+    noise_std = max(0.0004, rms * rng.uniform(0.006, 0.025))
+    return audio + rng_np_normal(rng, audio.shape[0], noise_std)
+
+
+def augment_audio(audio: np.ndarray, sample_rate: int, rng: random.Random) -> np.ndarray:
+    augmented = audio.copy()
+    if augmented.size == 0:
+        return augmented
+
+    gain = rng.uniform(0.82, 1.12)
     augmented *= gain
 
-    if augmented.size > 4:
-        shift = rng.randint(-max(1, augmented.size // 8), max(1, augmented.size // 8))
-        augmented = np.roll(augmented, shift)
+    if rng.random() < 0.12:
+        augmented = time_stretch_to_length(augmented, rng.uniform(0.985, 1.015), audio.shape[0])
 
-    if rng.random() < 0.55:
-        noise_std = rng.uniform(0.001, 0.008)
-        augmented += rng_np_normal(rng, augmented.shape[0], noise_std)
+    if rng.random() < 0.75:
+        max_early_ms = 80.0
+        max_late_ms = 120.0
+        shift_ms = rng.uniform(-max_late_ms, max_early_ms)
+        shift = int(round(shift_ms * sample_rate / 1000.0))
+        augmented = shift_audio(augmented, shift)
 
-    if rng.random() < 0.35:
-        speed = rng.uniform(0.9, 1.1)
-        new_length = max(1, int(round(augmented.shape[0] / speed)))
-        x_old = np.linspace(0.0, 1.0, num=augmented.shape[0], endpoint=False)
-        x_new = np.linspace(0.0, 1.0, num=new_length, endpoint=False)
-        stretched = np.interp(x_new, x_old, augmented).astype(np.float32)
-        if stretched.shape[0] >= audio.shape[0]:
-            start = (stretched.shape[0] - audio.shape[0]) // 2
-            augmented = stretched[start : start + audio.shape[0]]
-        else:
-            augmented = np.pad(stretched, (0, audio.shape[0] - stretched.shape[0]))
+    if rng.random() < 0.5:
+        augmented = apply_room_reflection(augmented, sample_rate, rng)
+
+    if rng.random() < 0.6:
+        augmented = apply_soft_bandlimit(augmented)
+
+    if rng.random() < 0.65:
+        augmented = add_microphone_noise(augmented, rng)
 
     return normalize_audio(augmented)
 
@@ -350,11 +416,12 @@ def try_mix_with_background(
         offset_index = rng.randrange(offset_count)
         start = offset_index * offset_step_samples
         end = start + audio.shape[0]
-        mixed = mix_at_snr(audio, background[start:end], snr_db)
+        mixed_snr_db = rng.uniform(max(3.0, snr_db - 2.5), snr_db + 3.5)
+        mixed = mix_at_snr(audio, background[start:end], mixed_snr_db)
         return mixed, {
             "background_path": background_path,
             "offset_sec": round(start / float(sample_rate), 3),
-            "snr_db": snr_db,
+            "snr_db": round(mixed_snr_db, 2),
         }
 
     return None
@@ -396,22 +463,26 @@ def prepare_audio_cache(
 
         for index in range(audio_augment_copies):
             augmented_path = cache_root / f"{pokemon_id:03d}_aug_{index:02d}.wav"
-            background_mix = try_mix_with_background(
-                audio=audio,
-                background_paths=background_paths,
-                background_cache=background_cache,
-                sample_rate=sample_rate,
-                offset_step_sec=audio_mix_offset_step,
-                snr_db=audio_mix_snr_db,
-                rng=rng,
-            )
-            augmentation = "background_mix"
+            background_mix = None
+            if background_paths and rng.random() < 0.75:
+                background_mix = try_mix_with_background(
+                    audio=audio,
+                    background_paths=background_paths,
+                    background_cache=background_cache,
+                    sample_rate=sample_rate,
+                    offset_step_sec=audio_mix_offset_step,
+                    snr_db=audio_mix_snr_db,
+                    rng=rng,
+                )
+
             details: dict[str, Any] = {}
             if background_mix is None:
-                augmented = augment_audio(audio, rng)
-                augmentation = "gain_shift_noise_speed"
+                augmented = augment_audio(audio, sample_rate, rng)
+                augmentation = "microphone_recording"
             else:
-                augmented, details = background_mix
+                mixed, details = background_mix
+                augmented = augment_audio(mixed, sample_rate, rng)
+                augmentation = "background_mix_microphone"
             write_wav(augmented_path, augmented, sample_rate)
             variant = {
                 "path": augmented_path,
@@ -438,7 +509,7 @@ def fit_on_canvas(image: Image.Image, size: int, rng: random.Random) -> Image.Im
     if max_side <= 0:
         return Image.new("RGBA", (size, size), (255, 255, 255, 255))
 
-    scale = rng.uniform(0.62, 0.88) * size / max_side
+    scale = rng.uniform(0.7, 0.92) * size / max_side
     new_size = (
         max(1, int(round(image.width * scale))),
         max(1, int(round(image.height * scale))),
@@ -447,8 +518,11 @@ def fit_on_canvas(image: Image.Image, size: int, rng: random.Random) -> Image.Im
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     max_x = max(0, size - sprite.width)
     max_y = max(0, size - sprite.height)
-    x = rng.randint(0, max_x) if max_x else 0
-    y = rng.randint(0, max_y) if max_y else 0
+    jitter = int(round(size * 0.07))
+    x = int(round((size - sprite.width) / 2 + rng.randint(-jitter, jitter)))
+    y = int(round((size - sprite.height) / 2 + rng.randint(-jitter, jitter)))
+    x = max(0, min(max_x, x))
+    y = max(0, min(max_y, y))
     canvas.alpha_composite(sprite, (x, y))
     return canvas
 
@@ -476,11 +550,11 @@ def random_background(size: int, rng: random.Random) -> Image.Image:
     background = Image.new("RGB", (size, size), color)
 
     noise_seed = rng.randint(0, 2**32 - 1)
-    noise = np.random.default_rng(noise_seed).normal(0, rng.uniform(3, 10), (size, size, 1))
+    noise = np.random.default_rng(noise_seed).normal(0, rng.uniform(2, 6), (size, size, 1))
     bg_np = np.array(background).astype(np.float32) + noise
 
     if rng.random() < 0.7:
-        axis = np.linspace(rng.uniform(-20, 10), rng.uniform(5, 24), size, dtype=np.float32)
+        axis = np.linspace(rng.uniform(-12, 6), rng.uniform(4, 14), size, dtype=np.float32)
         if rng.random() < 0.5:
             bg_np += axis[:, None, None]
         else:
@@ -500,12 +574,12 @@ def alpha_blur_mask(image: Image.Image, radius: float) -> Image.Image:
 
 def composite_shadow(background: Image.Image, foreground: Image.Image, rng: random.Random) -> Image.Image:
     shadow = Image.new("RGBA", foreground.size, (0, 0, 0, 0))
-    shadow_alpha = alpha_blur_mask(foreground, rng.uniform(4.0, 10.0))
-    opacity = rng.randint(35, 85)
+    shadow_alpha = alpha_blur_mask(foreground, rng.uniform(3.0, 7.0))
+    opacity = rng.randint(20, 55)
     shadow.putalpha(shadow_alpha.point(lambda value: int(value * opacity / 255)))
 
-    offset_x = rng.randint(-8, 12)
-    offset_y = rng.randint(5, 16)
+    offset_x = rng.randint(-4, 8)
+    offset_y = rng.randint(3, 12)
     layer = Image.new("RGBA", foreground.size, (0, 0, 0, 0))
     layer.alpha_composite(shadow, (offset_x, offset_y))
     layer.alpha_composite(foreground, (0, 0))
@@ -529,11 +603,11 @@ def perspective_coefficients(source: list[tuple[float, float]], target: list[tup
 def apply_camera_image_augmentation(image: Image.Image, rng: random.Random, size: int = 256) -> Image.Image:
     fitted = fit_on_canvas(image, size=size, rng=rng)
 
-    if rng.random() < 0.5:
+    if rng.random() < 0.18:
         fitted = ImageOps.mirror(fitted)
 
     fitted = fitted.rotate(
-        rng.uniform(-18.0, 18.0),
+        rng.uniform(-10.0, 10.0),
         resample=Image.Resampling.BICUBIC,
         expand=False,
         fillcolor=(0, 0, 0, 0),
@@ -542,8 +616,8 @@ def apply_camera_image_augmentation(image: Image.Image, rng: random.Random, size
     background = random_background(size, rng)
     composed = composite_shadow(background, fitted, rng)
 
-    if rng.random() < 0.7:
-        margin = rng.uniform(4.0, 20.0)
+    if rng.random() < 0.45:
+        margin = rng.uniform(2.0, 12.0)
         source = [(0, 0), (size, 0), (size, size), (0, size)]
         target = [
             (rng.uniform(0, margin), rng.uniform(0, margin)),
@@ -559,20 +633,20 @@ def apply_camera_image_augmentation(image: Image.Image, rng: random.Random, size
             Image.Resampling.BICUBIC,
         )
 
-    composed = ImageEnhance.Brightness(composed).enhance(rng.uniform(0.72, 1.28))
-    composed = ImageEnhance.Contrast(composed).enhance(rng.uniform(0.78, 1.25))
-    composed = ImageEnhance.Color(composed).enhance(rng.uniform(0.82, 1.2))
+    composed = ImageEnhance.Brightness(composed).enhance(rng.uniform(0.86, 1.16))
+    composed = ImageEnhance.Contrast(composed).enhance(rng.uniform(0.9, 1.14))
+    composed = ImageEnhance.Color(composed).enhance(rng.uniform(0.9, 1.12))
 
-    if rng.random() < 0.45:
-        composed = composed.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.2, 1.1)))
+    if rng.random() < 0.35:
+        composed = composed.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.15, 0.65)))
 
-    if rng.random() < 0.45:
+    if rng.random() < 0.18:
         composed = apply_cutout(composed, rng)
 
-    if rng.random() < 0.6:
+    if rng.random() < 0.45:
         composed = apply_sensor_noise(composed, rng)
 
-    if rng.random() < 0.55:
+    if rng.random() < 0.45:
         composed = apply_jpeg_degradation(composed, rng)
 
     return composed.resize((224, 224), Image.Resampling.LANCZOS)
@@ -581,45 +655,66 @@ def apply_camera_image_augmentation(image: Image.Image, rng: random.Random, size
 def apply_light_image_augmentation(image: Image.Image, rng: random.Random) -> Image.Image:
     rgb = Image.new("RGB", image.size, (255, 255, 255))
     rgb.paste(image.convert("RGBA"), mask=image.convert("RGBA").getchannel("A"))
-    if rng.random() < 0.5:
+    if rng.random() < 0.25:
         rgb = ImageOps.mirror(rgb)
     rgb = rgb.rotate(
-        rng.uniform(-12.0, 12.0),
+        rng.uniform(-8.0, 8.0),
         resample=Image.Resampling.BICUBIC,
         expand=False,
         fillcolor=(255, 255, 255),
     )
-    rgb = ImageEnhance.Brightness(rgb).enhance(rng.uniform(0.85, 1.15))
-    rgb = ImageEnhance.Contrast(rgb).enhance(rng.uniform(0.9, 1.15))
-    rgb = ImageEnhance.Color(rgb).enhance(rng.uniform(0.9, 1.15))
+    rgb = ImageEnhance.Brightness(rgb).enhance(rng.uniform(0.92, 1.08))
+    rgb = ImageEnhance.Contrast(rgb).enhance(rng.uniform(0.95, 1.08))
+    rgb = ImageEnhance.Color(rgb).enhance(rng.uniform(0.95, 1.08))
     return ImageOps.contain(rgb, (224, 224), Image.Resampling.LANCZOS)
 
 
 def apply_cutout(image: Image.Image, rng: random.Random) -> Image.Image:
     output = image.copy()
     width, height = output.size
-    draw_color = tuple(clamp_channel(channel + rng.randint(-20, 20)) for channel in output.getpixel((0, 0)))
-    holes = rng.randint(1, 3)
-    for _ in range(holes):
-        hole_width = rng.randint(max(8, width // 14), max(12, width // 5))
-        hole_height = rng.randint(max(8, height // 14), max(12, height // 5))
+    occluder_colors = [
+        (235, 230, 220),
+        (222, 224, 226),
+        (48, 48, 46),
+        (202, 177, 151),
+    ]
+    draw_color = tuple(clamp_channel(channel + rng.randint(-10, 10)) for channel in rng.choice(occluder_colors))
+    hole_width = rng.randint(max(6, width // 18), max(8, width // 9))
+    hole_height = rng.randint(max(6, height // 18), max(8, height // 9))
+    if rng.random() < 0.7:
+        side = rng.choice(("left", "right", "top", "bottom"))
+        if side == "left":
+            x = 0
+            y = rng.randint(0, max(0, height - hole_height))
+        elif side == "right":
+            x = width - hole_width
+            y = rng.randint(0, max(0, height - hole_height))
+        elif side == "top":
+            x = rng.randint(0, max(0, width - hole_width))
+            y = 0
+        else:
+            x = rng.randint(0, max(0, width - hole_width))
+            y = height - hole_height
+    else:
         x = rng.randint(0, max(0, width - hole_width))
         y = rng.randint(0, max(0, height - hole_height))
-        patch = Image.new("RGB", (hole_width, hole_height), draw_color)
-        output.paste(patch, (x, y))
+    patch = Image.new("RGB", (hole_width, hole_height), draw_color)
+    if rng.random() < 0.5:
+        patch = patch.filter(ImageFilter.GaussianBlur(radius=0.6))
+    output.paste(patch, (x, y))
     return output
 
 
 def apply_sensor_noise(image: Image.Image, rng: random.Random) -> Image.Image:
     array = np.array(image).astype(np.float32)
     seed = rng.randint(0, 2**32 - 1)
-    noise = np.random.default_rng(seed).normal(0, rng.uniform(2.0, 8.0), array.shape)
+    noise = np.random.default_rng(seed).normal(0, rng.uniform(1.0, 4.5), array.shape)
     return Image.fromarray(np.clip(array + noise, 0, 255).astype(np.uint8), mode="RGB")
 
 
 def apply_jpeg_degradation(image: Image.Image, rng: random.Random) -> Image.Image:
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=rng.randint(55, 88))
+    image.save(buffer, format="JPEG", quality=rng.randint(72, 95))
     buffer.seek(0)
     with Image.open(buffer) as compressed:
         return compressed.convert("RGB")
@@ -753,6 +848,29 @@ def split_train_val(paths: list[Path], val_ratio: float, rng: random.Random) -> 
     return train_paths, val_paths
 
 
+def build_augmented_records(
+    paths: list[Path],
+    target_count: int,
+    image_augmentation: str,
+    rng: random.Random,
+) -> list[tuple[Path, str]]:
+    if not paths:
+        return []
+
+    records: list[tuple[Path, str]] = [(path, image_augmentation) for path in paths]
+    target_count = max(len(records), target_count)
+    while len(records) < target_count:
+        records.append((rng.choice(paths), image_augmentation))
+    return records
+
+
+def select_augmented_audio_variant(audio_variants: list[dict[str, Any]], index: int) -> dict[str, Any]:
+    if len(audio_variants) <= 1:
+        return audio_variants[0]
+    augmented_variants = audio_variants[1:]
+    return augmented_variants[index % len(augmented_variants)]
+
+
 def build_processed_dataset(args: argparse.Namespace) -> Counter:
     raw_root = args.raw_root.expanduser().resolve()
     processed_root = args.processed_root.expanduser().resolve()
@@ -819,9 +937,35 @@ def build_processed_dataset(args: argparse.Namespace) -> Counter:
         summary["raw_val_images"] += len(val_paths)
         summary["raw_test_images"] += len(test_source)
 
-        for split, paths in (("val", val_paths), ("test", test_source)):
-            for index, image_path in enumerate(paths):
-                sample_id = f"{pokemon_id:03d}_{safe_stem(image_path.stem)}_{index:03d}"
+        image_augmentation = "camera" if camera_augmentation else "light"
+        split_records = {
+            "train": build_augmented_records(
+                train_paths,
+                max(0, args.target_train_count),
+                image_augmentation,
+                rng,
+            ),
+            "val": build_augmented_records(
+                val_paths,
+                max(0, args.target_val_count),
+                image_augmentation,
+                rng,
+            ),
+            "test": build_augmented_records(
+                test_source,
+                max(0, args.target_test_count),
+                image_augmentation,
+                rng,
+            ),
+        }
+
+        for split, records in split_records.items():
+            for index, (image_path, record_image_augmentation) in enumerate(records):
+                digest = stable_digest(
+                    f"{split}:{pokemon_id}:{image_path}:{index}:{record_image_augmentation}"
+                )
+                sample_id = f"{pokemon_id:03d}_{safe_stem(image_path.stem)}_{index:04d}_{digest}"
+                audio_variant = select_augmented_audio_variant(audio_variants, index)
                 create_sample(
                     processed_root=processed_root,
                     split=split,
@@ -829,42 +973,14 @@ def build_processed_dataset(args: argparse.Namespace) -> Counter:
                     label_index=label_index,
                     pokemon_id=pokemon_id,
                     image_path=image_path,
-                    audio_variant=audio_variants[0],
+                    audio_variant=audio_variant,
                     sample_id=sample_id,
                     rng=rng,
-                    image_augmentation="origin",
+                    image_augmentation=record_image_augmentation,
                     camera_augmentation=camera_augmentation,
                 )
                 summary[f"{split}_samples"] += 1
-
-        if not train_paths:
-            continue
-
-        train_records: list[tuple[Path, str]] = [(path, "origin") for path in train_paths]
-        target_count = max(len(train_records), args.target_train_count)
-        while len(train_records) < target_count:
-            train_records.append((rng.choice(train_paths), "camera" if camera_augmentation else "light"))
-
-        for index, (image_path, image_augmentation) in enumerate(train_records):
-            digest = stable_digest(f"{pokemon_id}:{image_path}:{index}:{image_augmentation}")
-            sample_id = f"{pokemon_id:03d}_{safe_stem(image_path.stem)}_{index:04d}_{digest}"
-            audio_variant = audio_variants[index % len(audio_variants)]
-            create_sample(
-                processed_root=processed_root,
-                split="train",
-                class_name=class_name,
-                label_index=label_index,
-                pokemon_id=pokemon_id,
-                image_path=image_path,
-                audio_variant=audio_variant,
-                sample_id=sample_id,
-                rng=rng,
-                image_augmentation=image_augmentation,
-                camera_augmentation=camera_augmentation,
-            )
-            summary["train_samples"] += 1
-            if image_augmentation != "origin":
-                summary["augmented_train_images"] += 1
+                summary[f"augmented_{split}_images"] += 1
 
     summary_path = processed_root / "dataset_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
