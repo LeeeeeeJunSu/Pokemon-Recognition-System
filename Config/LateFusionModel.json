@@ -27,15 +27,6 @@
     "hop_length": 256,
     "n_mels": 128,
     "f_min": 20.0,
-    "f_max": 11025.0,
-    "augmentation": true,
-    "horizontal_flip": true,
-    "rotation_degrees": 15.0,
-    "color_jitter": 0.2,
-    "use_spec_augment": true,
-    "time_mask_param": 32,
-    "freq_mask_param": 24,
-    "random_gain": 0.1,
-    "noise_std": 0.003
+    "f_max": 11025.0
   }
 }

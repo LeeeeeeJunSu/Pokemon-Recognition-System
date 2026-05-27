@@ -53,12 +53,6 @@ class _AudioModelConfig:
     f_min: float = 20.0
     f_max: float = 11025.0
     image_size: int = 224
-    augmentation: bool = True
-    use_spec_augment: bool = True
-    time_mask_param: int = 24
-    freq_mask_param: int = 16
-    random_gain: float = 0.05
-    noise_std: float = 0.002
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> "_AudioModelConfig":
@@ -78,9 +72,8 @@ class _AudioSample:
 
 
 class _AudioFeatureExtractor:
-    def __init__(self, config: _AudioModelConfig, train_mode: bool) -> None:
+    def __init__(self, config: _AudioModelConfig) -> None:
         self.config = config
-        self.train_mode = train_mode
         self.target_num_samples = int(config.sample_rate * config.clip_duration_seconds)
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.sample_rate,
@@ -93,21 +86,12 @@ class _AudioFeatureExtractor:
             power=2.0,
         )
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
-        self.time_mask = torchaudio.transforms.TimeMasking(
-            time_mask_param=config.time_mask_param
-        )
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(
-            freq_mask_param=config.freq_mask_param
-        )
 
     def __call__(self, audio_path: Path) -> torch.Tensor:
         waveform = self._load_waveform(audio_path)
         waveform = self._prepare_waveform(waveform)
         spectrogram = self.mel_transform(waveform.unsqueeze(0))
         spectrogram = self.amplitude_to_db(spectrogram)
-        if self.train_mode and self.config.augmentation and self.config.use_spec_augment:
-            spectrogram = self.freq_mask(spectrogram)
-            spectrogram = self.time_mask(spectrogram)
 
         spectrogram = spectrogram.squeeze(0)
         spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-6)
@@ -146,29 +130,15 @@ class _AudioFeatureExtractor:
 
     def _prepare_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
         waveform = waveform.flatten()
-        if self.train_mode and self.config.augmentation:
-            waveform = self._apply_waveform_augmentation(waveform)
 
         if waveform.numel() > self.target_num_samples:
-            if self.train_mode:
-                start = random.randint(0, waveform.numel() - self.target_num_samples)
-            else:
-                start = (waveform.numel() - self.target_num_samples) // 2
+            start = (waveform.numel() - self.target_num_samples) // 2
             waveform = waveform[start : start + self.target_num_samples]
         elif waveform.numel() < self.target_num_samples:
             pad_amount = self.target_num_samples - waveform.numel()
             waveform = F.pad(waveform, (0, pad_amount))
 
         return waveform.clamp(-1.0, 1.0)
-
-    def _apply_waveform_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
-        if self.config.random_gain > 0:
-            gain = 1.0 + random.uniform(-self.config.random_gain, self.config.random_gain)
-            waveform = waveform * gain
-        if self.config.noise_std > 0:
-            noise = torch.randn_like(waveform) * self.config.noise_std
-            waveform = waveform + noise
-        return waveform
 
 
 class _AudioOnlyDataset(Dataset):
@@ -226,17 +196,17 @@ class AudioModel(IModel):
             raise ValueError(f"No test samples found under: {dataset_root / 'test'}")
 
         train_loader = DataLoader(
-            _AudioOnlyDataset(train_samples, _AudioFeatureExtractor(self.config, train_mode=True)),
+            _AudioOnlyDataset(train_samples, _AudioFeatureExtractor(self.config)),
             **self._build_dataloader_kwargs(shuffle=True),
         )
         val_loader = None
         if val_samples:
             val_loader = DataLoader(
-                _AudioOnlyDataset(val_samples, _AudioFeatureExtractor(self.config, train_mode=False)),
+                _AudioOnlyDataset(val_samples, _AudioFeatureExtractor(self.config)),
                 **self._build_dataloader_kwargs(shuffle=False),
             )
         test_loader = DataLoader(
-            _AudioOnlyDataset(test_samples, _AudioFeatureExtractor(self.config, train_mode=False)),
+            _AudioOnlyDataset(test_samples, _AudioFeatureExtractor(self.config)),
             **self._build_dataloader_kwargs(shuffle=False),
         )
 
@@ -370,7 +340,7 @@ class AudioModel(IModel):
         inference_loader = DataLoader(
             _AudioOnlyDataset(
                 inference_samples,
-                _AudioFeatureExtractor(self.config, train_mode=False),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=False),
         )

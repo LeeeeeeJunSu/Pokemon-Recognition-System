@@ -11,8 +11,8 @@ PathLike = Union[str, Path]
 class IModel(ABC):
     """Common interface for all project models.
 
-    Runtime options such as hyperparameters, augmentation flags, dropout,
-    and early stopping must be resolved from files under the project-level
+    Runtime options such as hyperparameters, dropout, and early stopping
+    must be resolved from files under the project-level
     ``Config/`` directory rather than from these method signatures.
     """
 

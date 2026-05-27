@@ -40,10 +40,6 @@ class _ImageModelConfig:
     epochs: int = 10
     dropout: float = 0.0
     early_stopping_patience: int = 5
-    augmentation: bool = True
-    horizontal_flip: bool = True
-    rotation_degrees: float = 10.0
-    color_jitter: float = 0.1
     optimizer: str = "adamw"
     seed: int = 42
     device: str = "auto"
@@ -474,45 +470,7 @@ class ImageModel(IModel):
         return recursive_samples
 
     def _build_train_transform(self) -> transforms.Compose:
-        transform_steps: list[Any] = []
-        if self.config.augmentation:
-            transform_steps.append(
-                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0))
-            )
-            if self.config.horizontal_flip:
-                transform_steps.append(transforms.RandomHorizontalFlip())
-            if self.config.rotation_degrees > 0:
-                transform_steps.append(
-                    transforms.RandomRotation(self.config.rotation_degrees)
-                )
-            if self.config.color_jitter > 0:
-                jitter = self.config.color_jitter
-                transform_steps.append(
-                    transforms.ColorJitter(
-                        brightness=jitter,
-                        contrast=jitter,
-                        saturation=jitter,
-                        hue=min(jitter / 2.0, 0.5),
-                    )
-                )
-        else:
-            transform_steps.extend(
-                [
-                    transforms.Resize(self.config.resize_size),
-                    transforms.CenterCrop(self.config.image_size),
-                ]
-            )
-
-        transform_steps.extend(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
-        return transforms.Compose(transform_steps)
+        return self._build_eval_transform()
 
     def _build_eval_transform(self) -> transforms.Compose:
         return transforms.Compose(

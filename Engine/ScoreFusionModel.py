@@ -58,15 +58,6 @@ class _ScoreFusionConfig:
     n_mels: int = 128
     f_min: float = 20.0
     f_max: float = 11025.0
-    augmentation: bool = True
-    horizontal_flip: bool = True
-    rotation_degrees: float = 10.0
-    color_jitter: float = 0.1
-    use_spec_augment: bool = True
-    time_mask_param: int = 24
-    freq_mask_param: int = 16
-    random_gain: float = 0.05
-    noise_std: float = 0.002
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> "_ScoreFusionConfig":
@@ -87,9 +78,8 @@ class _MultimodalSample:
 
 
 class _AudioFeatureExtractor:
-    def __init__(self, config: _ScoreFusionConfig, train_mode: bool) -> None:
+    def __init__(self, config: _ScoreFusionConfig) -> None:
         self.config = config
-        self.train_mode = train_mode
         self.target_num_samples = int(config.sample_rate * config.clip_duration_seconds)
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.sample_rate,
@@ -102,21 +92,12 @@ class _AudioFeatureExtractor:
             power=2.0,
         )
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
-        self.time_mask = torchaudio.transforms.TimeMasking(
-            time_mask_param=config.time_mask_param
-        )
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(
-            freq_mask_param=config.freq_mask_param
-        )
 
     def __call__(self, audio_path: Path) -> torch.Tensor:
         waveform = self._load_waveform(audio_path)
         waveform = self._prepare_waveform(waveform)
         spectrogram = self.mel_transform(waveform.unsqueeze(0))
         spectrogram = self.amplitude_to_db(spectrogram)
-        if self.train_mode and self.config.augmentation and self.config.use_spec_augment:
-            spectrogram = self.freq_mask(spectrogram)
-            spectrogram = self.time_mask(spectrogram)
 
         spectrogram = spectrogram.squeeze(0)
         spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-6)
@@ -155,29 +136,15 @@ class _AudioFeatureExtractor:
 
     def _prepare_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
         waveform = waveform.flatten()
-        if self.train_mode and self.config.augmentation:
-            waveform = self._apply_waveform_augmentation(waveform)
 
         if waveform.numel() > self.target_num_samples:
-            if self.train_mode:
-                start = random.randint(0, waveform.numel() - self.target_num_samples)
-            else:
-                start = (waveform.numel() - self.target_num_samples) // 2
+            start = (waveform.numel() - self.target_num_samples) // 2
             waveform = waveform[start : start + self.target_num_samples]
         elif waveform.numel() < self.target_num_samples:
             pad_amount = self.target_num_samples - waveform.numel()
             waveform = F.pad(waveform, (0, pad_amount))
 
         return waveform.clamp(-1.0, 1.0)
-
-    def _apply_waveform_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
-        if self.config.random_gain > 0:
-            gain = 1.0 + random.uniform(-self.config.random_gain, self.config.random_gain)
-            waveform = waveform * gain
-        if self.config.noise_std > 0:
-            noise = torch.randn_like(waveform) * self.config.noise_std
-            waveform = waveform + noise
-        return waveform
 
 
 class _MultimodalDataset(Dataset):
@@ -288,7 +255,7 @@ class ScoreFusionModel(IModel):
             _MultimodalDataset(
                 train_samples,
                 self._build_image_train_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=True),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=True),
         )
@@ -298,7 +265,7 @@ class ScoreFusionModel(IModel):
                 _MultimodalDataset(
                     val_samples,
                     self._build_image_eval_transform(),
-                    _AudioFeatureExtractor(self.config, train_mode=False),
+                    _AudioFeatureExtractor(self.config),
                 ),
                 **self._build_dataloader_kwargs(shuffle=False),
             )
@@ -306,7 +273,7 @@ class ScoreFusionModel(IModel):
             _MultimodalDataset(
                 test_samples,
                 self._build_image_eval_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=False),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=False),
         )
@@ -442,7 +409,7 @@ class ScoreFusionModel(IModel):
             _MultimodalDataset(
                 inference_samples,
                 self._build_image_eval_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=False),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=False),
         )
@@ -650,45 +617,7 @@ class ScoreFusionModel(IModel):
         return recursive_samples
 
     def _build_image_train_transform(self) -> transforms.Compose:
-        transform_steps: list[Any] = []
-        if self.config.augmentation:
-            transform_steps.append(
-                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0))
-            )
-            if self.config.horizontal_flip:
-                transform_steps.append(transforms.RandomHorizontalFlip())
-            if self.config.rotation_degrees > 0:
-                transform_steps.append(
-                    transforms.RandomRotation(self.config.rotation_degrees)
-                )
-            if self.config.color_jitter > 0:
-                jitter = self.config.color_jitter
-                transform_steps.append(
-                    transforms.ColorJitter(
-                        brightness=jitter,
-                        contrast=jitter,
-                        saturation=jitter,
-                        hue=min(jitter / 2.0, 0.5),
-                    )
-                )
-        else:
-            transform_steps.extend(
-                [
-                    transforms.Resize(self.config.resize_size),
-                    transforms.CenterCrop(self.config.image_size),
-                ]
-            )
-
-        transform_steps.extend(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
-        return transforms.Compose(transform_steps)
+        return self._build_image_eval_transform()
 
     def _build_image_eval_transform(self) -> transforms.Compose:
         return transforms.Compose(

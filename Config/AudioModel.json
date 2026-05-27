@@ -23,12 +23,6 @@
     "n_mels": 128,
     "f_min": 20.0,
     "f_max": 11025.0,
-    "image_size": 224,
-    "augmentation": true,
-    "use_spec_augment": true,
-    "time_mask_param": 32,
-    "freq_mask_param": 24,
-    "random_gain": 0.1,
-    "noise_std": 0.003
+    "image_size": 224
   }
 }
