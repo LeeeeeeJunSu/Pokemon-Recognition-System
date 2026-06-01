@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-from PIL import Image
+from PIL import Image, ImageOps
 from scipy.io import wavfile
 from sklearn.metrics import (
     accuracy_score,
@@ -166,6 +166,7 @@ class _MultimodalDataset(Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor, int, str, str, str, str]:
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
+            image = ImageOps.exif_transpose(image)
             image = image.convert("RGB")
             image_tensor = self.image_transform(image)
         audio_tensor = self.audio_processor(sample.audio_path)

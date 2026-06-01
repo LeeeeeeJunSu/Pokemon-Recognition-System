@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import soundfile as sf
 import torch
 import torchaudio
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
@@ -220,6 +220,7 @@ class InferenceWorker(QThread):
 
     def _prepare_image_file(self, src: Path, dst: Path) -> None:
         with Image.open(src) as image:
+            image = ImageOps.exif_transpose(image)
             image = image.convert("RGB")
             image.save(dst, format="PNG")
 

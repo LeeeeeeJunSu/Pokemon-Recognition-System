@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -75,6 +75,7 @@ class _ImageOnlyDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str, str]:
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
+            image = ImageOps.exif_transpose(image)
             image = image.convert("RGB")
             tensor = self.transform(image)
         return (

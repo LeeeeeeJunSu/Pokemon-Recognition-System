@@ -316,17 +316,54 @@ class RealtimeInferenceWorker(QThread):
 
     def _open_camera(self, camera_index: int) -> Any:
         assert cv2 is not None
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0] if sys.platform.startswith("win") else [0]
-        last_camera = None
-        for backend in backends:
-            camera = cv2.VideoCapture(camera_index, backend)
-            if camera.isOpened():
+        backends = [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF), ("ANY", 0)] if sys.platform.startswith("win") else [("ANY", 0)]
+        camera_indices = self._candidate_camera_indices(camera_index)
+        errors: list[str] = []
+
+        for candidate_index in camera_indices:
+            for backend_name, backend in backends:
+                camera = cv2.VideoCapture(candidate_index, backend)
+                if not camera.isOpened():
+                    errors.append(f"index={candidate_index}, backend={backend_name}: open failed")
+                    camera.release()
+                    continue
+
                 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                return camera
-            last_camera = camera
-            camera.release()
-        raise RuntimeError(f"카메라를 열 수 없습니다. camera_index={camera_index}, last={last_camera}")
+                frame_ok = False
+                frame = None
+                for _ in range(5):
+                    frame_ok, frame = camera.read()
+                    if frame_ok:
+                        break
+                    time.sleep(0.05)
+
+                if frame_ok and self._is_usable_camera_frame(frame):
+                    self.status_changed.emit(f"카메라 index={candidate_index}, backend={backend_name}를 사용합니다.")
+                    return camera
+
+                reason = "black frame" if frame_ok else "frame read failed"
+                errors.append(f"index={candidate_index}, backend={backend_name}: {reason}")
+                camera.release()
+
+        requested = "자동" if camera_index < 0 else str(camera_index)
+        detail = "\n".join(errors[-12:])
+        raise RuntimeError(f"카메라를 열 수 없습니다. 요청={requested}\n{detail}")
+
+    def _candidate_camera_indices(self, camera_index: int) -> list[int]:
+        fallback_indices = [1, 0, 2, 3, 4, 5, 6, 7]
+        if camera_index < 0:
+            return fallback_indices
+        return [camera_index] + [index for index in fallback_indices if index != camera_index]
+
+    def _is_usable_camera_frame(self, frame: Any) -> bool:
+        if frame is None:
+            return False
+        array = np.asarray(frame)
+        if array.size == 0:
+            return False
+        gray = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY) if array.ndim == 3 else array
+        return not (float(gray.mean()) < 3.0 and float(gray.std()) < 3.0)
 
     def _optimize_model_for_single_sample(self, model: Any) -> None:
         if hasattr(model, "config"):
@@ -475,8 +512,9 @@ class RealtimeInferenceWindow(QMainWindow):
         result_base_button.clicked.connect(self._choose_result_base)
 
         self.camera_index_spin = QSpinBox()
-        self.camera_index_spin.setRange(0, 16)
-        self.camera_index_spin.setValue(0)
+        self.camera_index_spin.setRange(-1, 16)
+        self.camera_index_spin.setSpecialValueText("자동")
+        self.camera_index_spin.setValue(-1)
 
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0.2, 60.0)
@@ -751,15 +789,30 @@ class RealtimeInferenceWindow(QMainWindow):
             model_name = str(summary.get("model_name", ""))
             if model_name not in MODEL_REGISTRY:
                 continue
-            run_root = Path(str(summary.get("result_root") or summary_path.parents[1])).expanduser()
+            local_run_root = summary_path.parent.parent if summary_path.parent.name == "logs" else summary_path.parent
+            stored_run_root = Path(str(summary.get("result_root") or local_run_root)).expanduser()
+            run_root = stored_run_root if stored_run_root.exists() else local_run_root
             for key, kind in (("best_checkpoint", "best"), ("last_checkpoint", "last")):
                 checkpoint_value = summary.get(key)
                 if not checkpoint_value:
                     continue
-                checkpoint_path = Path(str(checkpoint_value)).expanduser()
-                if not checkpoint_path.exists():
-                    checkpoint_path = run_root / "checkpoints" / Path(str(checkpoint_value)).name
-                if not checkpoint_path.exists():
+                checkpoint_value_path = Path(str(checkpoint_value)).expanduser()
+                candidate_paths = [checkpoint_value_path]
+                if not checkpoint_value_path.is_absolute():
+                    candidate_paths.extend(
+                        [
+                            run_root / checkpoint_value_path,
+                            local_run_root / checkpoint_value_path,
+                        ]
+                    )
+                candidate_paths.extend(
+                    [
+                        run_root / "checkpoints" / checkpoint_value_path.name,
+                        local_run_root / "checkpoints" / checkpoint_value_path.name,
+                    ]
+                )
+                checkpoint_path = next((path for path in candidate_paths if path.exists()), None)
+                if checkpoint_path is None:
                     continue
                 options.append(
                     CheckpointOption(
