@@ -21,6 +21,7 @@ AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aiff", ".aif"}
 DEFAULT_SAMPLE_RATE = 22050
 RAW_CLASS_ALIASES = {
     "Farfetchd": ("Farfetch",),
+    "Sandslash": ("Alolan Sandslash",),
 }
 POKEMON_NAME_CORRECTIONS = {
     "Exeggcutor": "Exeggutor",
@@ -30,17 +31,27 @@ POKEMON_NAME_CORRECTIONS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build the project's paired image/audio dataset layout from the Pokemon raw "
-            "images and cries. Train images can be expanded with phone-camera-style "
-            "augmentation, and train audio can be mixed with background audio plus "
-            "mild microphone effects for better real-world recording robustness."
+            "Build the project's paired image/audio dataset layout from the first "
+            "shared Pokemon set, the second shared train/test image sets, and BGM."
         )
     )
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=Path("Data/Pokemon/raw"),
-        help="Raw Pokemon dataset root. Expected: Image/train, Image/test, cry, pokemon_dict.json.",
+        default=Path("Data/Pokemon/1차 공유본"),
+        help="First shared Pokemon dataset root. Expected: Image/train, cry, pokemon_dict.json.",
+    )
+    parser.add_argument(
+        "--second-train-root",
+        type=Path,
+        default=Path("Data/Pokemon/2차 공유본 Train"),
+        help="Second shared train image root. Expected: <class_name>/*.png.",
+    )
+    parser.add_argument(
+        "--second-test-root",
+        type=Path,
+        default=Path("Data/Pokemon/2차 공유본 Test"),
+        help="Second shared test image root. Expected: test/<class_name>/*.png or <class_name>/*.png.",
     )
     parser.add_argument(
         "--processed-root",
@@ -58,19 +69,19 @@ def parse_args() -> argparse.Namespace:
         "--target-val-count",
         type=int,
         default=50,
-        help="Minimum number of validation samples to create per class after augmentation.",
+        help="Deprecated. Second shared test images are split 50/50 into val/test.",
     )
     parser.add_argument(
         "--target-test-count",
         type=int,
         default=50,
-        help="Minimum number of test samples to create per class after augmentation.",
+        help="Deprecated. Second shared test images are split 50/50 into val/test.",
     )
     parser.add_argument(
         "--val-ratio",
         type=float,
         default=0.1,
-        help="Fraction of raw train images to reserve for validation before augmentation.",
+        help="Deprecated. First shared images are all used for train.",
     )
     parser.add_argument(
         "--sample-rate",
@@ -101,10 +112,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio-background-root",
         type=Path,
-        default=None,
+        default=Path("Data/Pokemon/BGM"),
         help=(
-            "Optional background audio directory for SNR-based cry/background mixing. "
-            "If omitted, the script uses a background directory under raw root when present."
+            "Background audio directory for validation/test SNR-based cry/background mixing."
         ),
     )
     parser.add_argument(
@@ -158,31 +168,36 @@ def stable_digest(value: str, length: int = 10) -> str:
 
 def collect_image_paths(split_root: Path, class_name: str) -> list[Path]:
     candidates = (class_name, *RAW_CLASS_ALIASES.get(class_name, ()))
-    class_dir = split_root / class_name
+    class_dirs: list[Path] = []
     for candidate in candidates:
         candidate_dir = split_root / candidate
         if candidate_dir.exists():
-            class_dir = candidate_dir
-            break
+            class_dirs.append(candidate_dir)
 
-    if not class_dir.exists():
+    if not class_dirs:
         normalized_candidates = {normalize_name(candidate) for candidate in candidates}
-        matches = [
+        class_dirs = [
             path
             for path in split_root.iterdir()
             if path.is_dir() and normalize_name(path.name) in normalized_candidates
         ]
-        if matches:
-            class_dir = matches[0]
 
-    if not class_dir.exists():
+    if not class_dirs:
         return []
 
-    return sorted(
-        path
-        for path in class_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    paths: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for class_dir in class_dirs:
+        resolved_dir = class_dir.resolve()
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+        paths.extend(
+            path
+            for path in class_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    return sorted(paths)
 
 
 def collect_audio_paths(root: Path | None) -> list[Path]:
@@ -754,6 +769,9 @@ def write_meta(
     audio_background: Path | None = None,
     audio_mix_offset_sec: float | None = None,
     audio_mix_snr_db: float | None = None,
+    source_dataset: str | None = None,
+    source_split: str | None = None,
+    processing_note: str | None = None,
 ) -> None:
     audio_meta: dict[str, Any] = {
         "original_path": str(audio_source.as_posix()),
@@ -780,6 +798,12 @@ def write_meta(
         },
         "audio": audio_meta,
     }
+    if source_dataset is not None:
+        meta["source_dataset"] = source_dataset
+    if source_split is not None:
+        meta["source_split"] = source_split
+    if processing_note is not None:
+        meta["processing_note"] = processing_note
     with (sample_dir / "meta.json").open("w", encoding="utf-8") as handle:
         json.dump(meta, handle, ensure_ascii=False, indent=2)
 
@@ -796,6 +820,9 @@ def create_sample(
     rng: random.Random,
     image_augmentation: str,
     camera_augmentation: bool,
+    source_dataset: str | None = None,
+    source_split: str | None = None,
+    processing_note: str | None = None,
 ) -> None:
     sample_dir = processed_root / split / class_name / sample_id
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -832,6 +859,9 @@ def create_sample(
         ),
         audio_mix_offset_sec=audio_variant.get("offset_sec"),
         audio_mix_snr_db=audio_variant.get("snr_db"),
+        source_dataset=source_dataset,
+        source_split=source_split,
+        processing_note=processing_note,
     )
 
 
@@ -846,6 +876,70 @@ def split_train_val(paths: list[Path], val_ratio: float, rng: random.Random) -> 
     val_paths = sorted(shuffled[:val_count])
     train_paths = sorted(shuffled[val_count:])
     return train_paths, val_paths
+
+
+def split_half_val_test(paths: list[Path], rng: random.Random) -> tuple[list[Path], list[Path]]:
+    shuffled = list(paths)
+    rng.shuffle(shuffled)
+    if len(shuffled) < 2:
+        return sorted(shuffled), []
+    val_count = len(shuffled) // 2
+    return sorted(shuffled[:val_count]), sorted(shuffled[val_count:])
+
+
+def resolve_second_test_image_root(root: Path) -> Path:
+    for child_name in ("test", "Test"):
+        child = root / child_name
+        if child.exists() and child.is_dir():
+            return child
+    return root
+
+
+def create_background_audio_variant(
+    raw_root: Path,
+    cache_root: Path,
+    pokemon_id: int,
+    sample_rate: int,
+    background_paths: list[Path],
+    background_cache: dict[Path, np.ndarray],
+    audio_mix_offset_step: float,
+    audio_mix_snr_db: float,
+    rng: random.Random,
+    variant_id: str,
+) -> dict[str, Any]:
+    if not background_paths:
+        raise ValueError("BGM/background audio files are required for validation/test audio.")
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    source_path = raw_root / "cry" / f"{pokemon_id}.ogg"
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing Pokemon cry: {source_path}")
+
+    audio, _ = load_audio(source_path, sample_rate)
+    background_mix = try_mix_with_background(
+        audio=audio,
+        background_paths=background_paths,
+        background_cache=background_cache,
+        sample_rate=sample_rate,
+        offset_step_sec=audio_mix_offset_step,
+        snr_db=audio_mix_snr_db,
+        rng=rng,
+    )
+    if background_mix is None:
+        raise RuntimeError(f"Could not mix BGM with Pokemon cry: {source_path}")
+
+    mixed, details = background_mix
+    augmented = augment_audio(mixed, sample_rate, rng)
+    safe_variant_id = safe_stem(variant_id)
+    augmented_path = cache_root / f"{pokemon_id:03d}_{safe_variant_id}.wav"
+    write_wav(augmented_path, augmented, sample_rate)
+    variant = {
+        "path": augmented_path,
+        "augmentation": "background_mix_microphone",
+        "source_path": source_path,
+    }
+    variant.update(details)
+    return variant
 
 
 def build_augmented_records(
@@ -873,15 +967,19 @@ def select_augmented_audio_variant(audio_variants: list[dict[str, Any]], index: 
 
 def build_processed_dataset(args: argparse.Namespace) -> Counter:
     raw_root = args.raw_root.expanduser().resolve()
+    second_train_root = args.second_train_root.expanduser().resolve()
+    second_test_root = resolve_second_test_image_root(args.second_test_root.expanduser().resolve())
     processed_root = args.processed_root.expanduser().resolve()
     image_root = raw_root / "Image"
 
     if not raw_root.exists():
         raise FileNotFoundError(f"Raw root not found: {raw_root}")
+    if not second_train_root.exists():
+        raise FileNotFoundError(f"Second shared train root not found: {second_train_root}")
+    if not second_test_root.exists():
+        raise FileNotFoundError(f"Second shared test root not found: {second_test_root}")
     if not (image_root / "train").exists():
         raise FileNotFoundError(f"Missing train image directory: {image_root / 'train'}")
-    if not (image_root / "test").exists():
-        raise FileNotFoundError(f"Missing test image directory: {image_root / 'test'}")
     if not (raw_root / "cry").exists():
         raise FileNotFoundError(f"Missing cry directory: {raw_root / 'cry'}")
 
@@ -890,82 +988,148 @@ def build_processed_dataset(args: argparse.Namespace) -> Counter:
     classes: list[tuple[int, str]] = []
     for pokemon_id, class_name in sorted(pokemon_map.items()):
         has_cry = (raw_root / "cry" / f"{pokemon_id}.ogg").exists()
-        has_train = bool(collect_image_paths(image_root / "train", class_name))
-        has_test = bool(collect_image_paths(image_root / "test", class_name))
-        if has_cry and (has_train or has_test):
+        has_first_train = bool(collect_image_paths(image_root / "train", class_name))
+        has_second_train = bool(collect_image_paths(second_train_root, class_name))
+        has_second_test = bool(collect_image_paths(second_test_root, class_name))
+        if has_cry and (has_first_train or has_second_train or has_second_test):
             classes.append((pokemon_id, class_name))
 
     if not classes:
-        raise ValueError(f"No usable Pokemon classes found under: {raw_root}")
+        raise ValueError(
+            "No usable Pokemon classes found with first shared train, second shared images, and cries."
+        )
 
     ensure_clean_directory(processed_root)
     for split in ("train", "val", "test"):
         (processed_root / split).mkdir(parents=True, exist_ok=True)
 
     label_indices = write_labels_json(processed_root, classes)
-    audio_background_root = resolve_audio_background_root(raw_root, args.audio_background_root)
-    background_paths = collect_audio_paths(audio_background_root)
-    if args.audio_background_root is not None and not background_paths:
-        raise ValueError(f"No background audio files found under: {audio_background_root}")
-    audio_cache = prepare_audio_cache(
+    background_root = resolve_audio_background_root(raw_root, args.audio_background_root)
+    background_paths = collect_audio_paths(background_root)
+    if not background_paths:
+        raise ValueError(f"No BGM/background audio files found under: {background_root}")
+
+    train_audio_cache = prepare_audio_cache(
         raw_root=raw_root,
         processed_root=processed_root,
         pokemon_ids=[pokemon_id for pokemon_id, _ in classes],
         sample_rate=args.sample_rate,
         audio_augment_copies=max(0, args.audio_augment_copies),
-        background_paths=background_paths,
+        background_paths=[],
         audio_mix_offset_step=args.audio_mix_offset_step,
         audio_mix_snr_db=args.audio_mix_snr_db,
         rng=rng,
     )
+    eval_audio_cache_root = processed_root / "_audio_cache_bgm"
+    eval_background_cache: dict[Path, np.ndarray] = {}
 
     summary: Counter = Counter()
     camera_augmentation = not args.disable_camera_augmentation
     summary["audio_background_files"] = len(background_paths)
+    summary["classes"] = len(classes)
 
     for pokemon_id, class_name in classes:
         label_index = label_indices[pokemon_id]
-        train_source = collect_image_paths(image_root / "train", class_name)
-        test_source = collect_image_paths(image_root / "test", class_name)
-        train_paths, val_paths = split_train_val(train_source, args.val_ratio, rng)
-        audio_variants = audio_cache.get(pokemon_id, [])
-        if not audio_variants:
+        first_train_paths = collect_image_paths(image_root / "train", class_name)
+        second_train_paths = collect_image_paths(second_train_root, class_name)
+        second_test_paths = collect_image_paths(second_test_root, class_name)
+        val_paths, test_paths = split_half_val_test(second_test_paths, rng)
+        train_audio_variants = train_audio_cache.get(pokemon_id, [])
+        if not train_audio_variants:
             continue
 
-        summary["classes"] += 1
-        summary["raw_train_images"] += len(train_paths)
-        summary["raw_val_images"] += len(val_paths)
-        summary["raw_test_images"] += len(test_source)
+        summary["first_shared_train_images"] += len(first_train_paths)
+        summary["second_shared_train_images"] += len(second_train_paths)
+        summary["second_shared_test_images"] += len(second_test_paths)
+        summary["second_shared_val_split_images"] += len(val_paths)
+        summary["second_shared_test_split_images"] += len(test_paths)
 
         image_augmentation = "camera" if camera_augmentation else "light"
-        split_records = {
-            "train": build_augmented_records(
-                train_paths,
-                max(0, args.target_train_count),
-                image_augmentation,
-                rng,
-            ),
-            "val": build_augmented_records(
-                val_paths,
-                max(0, args.target_val_count),
-                image_augmentation,
-                rng,
-            ),
-            "test": build_augmented_records(
-                test_source,
-                max(0, args.target_test_count),
-                image_augmentation,
-                rng,
-            ),
-        }
+        first_train_records = build_augmented_records(
+            first_train_paths,
+            max(0, args.target_train_count),
+            image_augmentation,
+            rng,
+        )
 
-        for split, records in split_records.items():
-            for index, (image_path, record_image_augmentation) in enumerate(records):
-                digest = stable_digest(
-                    f"{split}:{pokemon_id}:{image_path}:{index}:{record_image_augmentation}"
+        for index, (image_path, record_image_augmentation) in enumerate(first_train_records):
+            digest = stable_digest(
+                f"train:first:{pokemon_id}:{image_path}:{index}:{record_image_augmentation}"
+            )
+            sample_id = f"{pokemon_id:03d}_first_{safe_stem(image_path.stem)}_{index:04d}_{digest}"
+            audio_variant = select_augmented_audio_variant(train_audio_variants, index)
+            create_sample(
+                processed_root=processed_root,
+                split="train",
+                class_name=class_name,
+                label_index=label_index,
+                pokemon_id=pokemon_id,
+                image_path=image_path,
+                audio_variant=audio_variant,
+                sample_id=sample_id,
+                rng=rng,
+                image_augmentation=record_image_augmentation,
+                camera_augmentation=camera_augmentation,
+                source_dataset="1차 공유본",
+                source_split="Image/train",
+                processing_note=(
+                    "first shared train sample: image expanded with deterministic augmentation; "
+                    "audio uses microphone-style augmented cry variants"
+                ),
+            )
+            summary["train_samples"] += 1
+            summary["first_shared_augmented_train_samples"] += 1
+            summary[f"train_image_augmentation_{record_image_augmentation}"] += 1
+            summary[f"train_audio_augmentation_{audio_variant['augmentation']}"] += 1
+
+        for index, image_path in enumerate(second_train_paths):
+            digest = stable_digest(f"train:second:{pokemon_id}:{image_path}:{index}")
+            sample_id = f"{pokemon_id:03d}_second_train_{safe_stem(image_path.stem)}_{index:05d}_{digest}"
+            audio_variant = select_augmented_audio_variant(train_audio_variants, index)
+            create_sample(
+                processed_root=processed_root,
+                split="train",
+                class_name=class_name,
+                label_index=label_index,
+                pokemon_id=pokemon_id,
+                image_path=image_path,
+                audio_variant=audio_variant,
+                sample_id=sample_id,
+                rng=rng,
+                image_augmentation="origin",
+                camera_augmentation=False,
+                source_dataset="2차 공유본 Train",
+                source_split=class_name.lower(),
+                processing_note=(
+                    "second shared train sample: image copied/resized only; "
+                    "audio uses microphone-style augmented cry variants"
+                ),
+            )
+            summary["train_samples"] += 1
+            summary["second_shared_train_samples"] += 1
+            summary["train_image_augmentation_origin"] += 1
+            summary[f"train_audio_augmentation_{audio_variant['augmentation']}"] += 1
+
+        eval_split_paths = {
+            "val": val_paths,
+            "test": test_paths,
+        }
+        for split, paths in eval_split_paths.items():
+            for index, image_path in enumerate(paths):
+                digest = stable_digest(f"{split}:second_test:{pokemon_id}:{image_path}:{index}")
+                sample_id = f"{pokemon_id:03d}_second_test_{safe_stem(image_path.stem)}_{index:05d}_{digest}"
+                audio_variant = create_background_audio_variant(
+                    raw_root=raw_root,
+                    cache_root=eval_audio_cache_root,
+                    pokemon_id=pokemon_id,
+                    sample_rate=args.sample_rate,
+                    background_paths=background_paths,
+                    background_cache=eval_background_cache,
+                    audio_mix_offset_step=args.audio_mix_offset_step,
+                    audio_mix_snr_db=args.audio_mix_snr_db,
+                    rng=rng,
+                    variant_id=f"{split}_{sample_id}",
                 )
-                sample_id = f"{pokemon_id:03d}_{safe_stem(image_path.stem)}_{index:04d}_{digest}"
-                audio_variant = select_augmented_audio_variant(audio_variants, index)
                 create_sample(
                     processed_root=processed_root,
                     split=split,
@@ -976,18 +1140,28 @@ def build_processed_dataset(args: argparse.Namespace) -> Counter:
                     audio_variant=audio_variant,
                     sample_id=sample_id,
                     rng=rng,
-                    image_augmentation=record_image_augmentation,
-                    camera_augmentation=camera_augmentation,
+                    image_augmentation="origin",
+                    camera_augmentation=False,
+                    source_dataset="2차 공유본 Test",
+                    source_split=class_name.lower(),
+                    processing_note=(
+                        "second shared test sample: image copied/resized only; "
+                        "audio uses BGM-mixed augmented cry variants from the first shared audio"
+                    ),
                 )
                 summary[f"{split}_samples"] += 1
-                summary[f"augmented_{split}_images"] += 1
+                summary[f"second_shared_{split}_samples"] += 1
+                summary[f"{split}_image_augmentation_origin"] += 1
+                summary[f"{split}_audio_augmentation_{audio_variant['augmentation']}"] += 1
 
     summary_path = processed_root / "dataset_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(dict(sorted(summary.items())), handle, ensure_ascii=False, indent=2)
 
-    if (processed_root / "_audio_cache").exists():
-        shutil.rmtree(processed_root / "_audio_cache")
+    for cache_name in ("_audio_cache", "_audio_cache_bgm"):
+        cache_root = processed_root / cache_name
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
 
     return summary
 

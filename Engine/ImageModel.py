@@ -18,12 +18,13 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import ViT_B_16_Weights, vit_b_16
 
 try:
     from .IModel import IModel, PathLike
+    from .VisionTransformerFactory import build_vit_b_16
 except ImportError:
     from IModel import IModel, PathLike
+    from VisionTransformerFactory import build_vit_b_16
 
 
 @dataclass
@@ -32,6 +33,7 @@ class _ImageModelConfig:
     pretrained: bool = False
     pretrained_weights: str = "IMAGENET1K_V1"
     image_size: int = 224
+    patch_size: int = 16
     resize_size: int = 256
     batch_size: int = 16
     num_workers: int = 0
@@ -490,16 +492,12 @@ class ImageModel(IModel):
         if self.config.model_name != "vit_b_16":
             raise ValueError(f"Unsupported image model: {self.config.model_name}")
 
-        weights = None
-        if use_pretrained:
-            try:
-                weights = ViT_B_16_Weights[self.config.pretrained_weights]
-            except KeyError as error:
-                raise ValueError(
-                    f"Unsupported pretrained weights: {self.config.pretrained_weights}"
-                ) from error
-
-        model = vit_b_16(weights=weights)
+        model = build_vit_b_16(
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            use_pretrained=use_pretrained,
+            pretrained_weights=self.config.pretrained_weights,
+        )
         in_features = model.heads.head.in_features
         model.heads.head = nn.Sequential(
             nn.Dropout(self.config.dropout),

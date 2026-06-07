@@ -9,7 +9,7 @@
     "weight_decay": 0.05,
     "epochs": 30,
     "dropout": 0.1,
-    "early_stopping_patience": 8,
+    "early_stopping_patience": 0,
     "optimizer": "adamw",
     "seed": 42,
     "device": "cuda",
@@ -23,6 +23,7 @@
     "n_mels": 128,
     "f_min": 20.0,
     "f_max": 11025.0,
-    "image_size": 224
+    "image_size": 100,
+    "patch_size": 10
   }
 }

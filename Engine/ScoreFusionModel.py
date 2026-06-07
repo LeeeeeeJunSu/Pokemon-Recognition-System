@@ -21,12 +21,13 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import ViT_B_16_Weights, vit_b_16
 
 try:
     from .IModel import IModel, PathLike
+    from .VisionTransformerFactory import build_vit_b_16
 except ImportError:
     from IModel import IModel, PathLike
+    from VisionTransformerFactory import build_vit_b_16
 
 
 @dataclass
@@ -36,6 +37,7 @@ class _ScoreFusionConfig:
     pretrained: bool = False
     pretrained_weights: str = "IMAGENET1K_V1"
     image_size: int = 224
+    patch_size: int = 16
     resize_size: int = 256
     batch_size: int = 8
     num_workers: int = 0
@@ -634,15 +636,12 @@ class ScoreFusionModel(IModel):
         )
 
     def _build_feature_backbone(self, use_pretrained: bool) -> tuple[nn.Module, int]:
-        weights = None
-        if use_pretrained:
-            try:
-                weights = ViT_B_16_Weights[self.config.pretrained_weights]
-            except KeyError as error:
-                raise ValueError(
-                    f"Unsupported pretrained weights: {self.config.pretrained_weights}"
-                ) from error
-        backbone = vit_b_16(weights=weights)
+        backbone = build_vit_b_16(
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            use_pretrained=use_pretrained,
+            pretrained_weights=self.config.pretrained_weights,
+        )
         feature_dim = backbone.heads.head.in_features
         backbone.heads = nn.Identity()
         return backbone, feature_dim
