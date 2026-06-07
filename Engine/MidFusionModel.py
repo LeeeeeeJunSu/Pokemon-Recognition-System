@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-from PIL import Image
+from PIL import Image, ImageOps
 from scipy.io import wavfile
 from sklearn.metrics import (
     accuracy_score,
@@ -21,12 +21,13 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import ViT_B_16_Weights, vit_b_16
 
 try:
     from .IModel import IModel, PathLike
+    from .VisionTransformerFactory import build_vit_b_16
 except ImportError:
     from IModel import IModel, PathLike
+    from VisionTransformerFactory import build_vit_b_16
 
 
 @dataclass
@@ -36,6 +37,7 @@ class _MidFusionConfig:
     pretrained: bool = False
     pretrained_weights: str = "IMAGENET1K_V1"
     image_size: int = 224
+    patch_size: int = 16
     resize_size: int = 256
     batch_size: int = 8
     num_workers: int = 0
@@ -43,6 +45,12 @@ class _MidFusionConfig:
     weight_decay: float = 1e-4
     epochs: int = 10
     dropout: float = 0.0
+    label_smoothing: float = 0.0
+    train_augmentation: bool = False
+    random_erasing_probability: float = 0.0
+    freeze_backbone_epochs: int = 0
+    backbone_lr_scale: float = 1.0
+    modality_dropout: float = 0.0
     token_dim: int = 512
     transformer_layers: int = 2
     transformer_heads: int = 8
@@ -63,15 +71,6 @@ class _MidFusionConfig:
     n_mels: int = 128
     f_min: float = 20.0
     f_max: float = 11025.0
-    augmentation: bool = True
-    horizontal_flip: bool = True
-    rotation_degrees: float = 10.0
-    color_jitter: float = 0.1
-    use_spec_augment: bool = True
-    time_mask_param: int = 24
-    freq_mask_param: int = 16
-    random_gain: float = 0.05
-    noise_std: float = 0.002
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> "_MidFusionConfig":
@@ -92,9 +91,8 @@ class _MultimodalSample:
 
 
 class _AudioFeatureExtractor:
-    def __init__(self, config: _MidFusionConfig, train_mode: bool) -> None:
+    def __init__(self, config: _MidFusionConfig) -> None:
         self.config = config
-        self.train_mode = train_mode
         self.target_num_samples = int(config.sample_rate * config.clip_duration_seconds)
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.sample_rate,
@@ -107,21 +105,12 @@ class _AudioFeatureExtractor:
             power=2.0,
         )
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
-        self.time_mask = torchaudio.transforms.TimeMasking(
-            time_mask_param=config.time_mask_param
-        )
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(
-            freq_mask_param=config.freq_mask_param
-        )
 
     def __call__(self, audio_path: Path) -> torch.Tensor:
         waveform = self._load_waveform(audio_path)
         waveform = self._prepare_waveform(waveform)
         spectrogram = self.mel_transform(waveform.unsqueeze(0))
         spectrogram = self.amplitude_to_db(spectrogram)
-        if self.train_mode and self.config.augmentation and self.config.use_spec_augment:
-            spectrogram = self.freq_mask(spectrogram)
-            spectrogram = self.time_mask(spectrogram)
 
         spectrogram = spectrogram.squeeze(0)
         spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-6)
@@ -160,29 +149,15 @@ class _AudioFeatureExtractor:
 
     def _prepare_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
         waveform = waveform.flatten()
-        if self.train_mode and self.config.augmentation:
-            waveform = self._apply_waveform_augmentation(waveform)
 
         if waveform.numel() > self.target_num_samples:
-            if self.train_mode:
-                start = random.randint(0, waveform.numel() - self.target_num_samples)
-            else:
-                start = (waveform.numel() - self.target_num_samples) // 2
+            start = (waveform.numel() - self.target_num_samples) // 2
             waveform = waveform[start : start + self.target_num_samples]
         elif waveform.numel() < self.target_num_samples:
             pad_amount = self.target_num_samples - waveform.numel()
             waveform = F.pad(waveform, (0, pad_amount))
 
         return waveform.clamp(-1.0, 1.0)
-
-    def _apply_waveform_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
-        if self.config.random_gain > 0:
-            gain = 1.0 + random.uniform(-self.config.random_gain, self.config.random_gain)
-            waveform = waveform * gain
-        if self.config.noise_std > 0:
-            noise = torch.randn_like(waveform) * self.config.noise_std
-            waveform = waveform + noise
-        return waveform
 
 
 class _MultimodalDataset(Dataset):
@@ -204,6 +179,7 @@ class _MultimodalDataset(Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor, int, str, str, str, str]:
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
+            image = ImageOps.exif_transpose(image)
             image = image.convert("RGB")
             image_tensor = self.image_transform(image)
         audio_tensor = self.audio_processor(sample.audio_path)
@@ -231,10 +207,12 @@ class _MidFusionNetwork(nn.Module):
         transformer_heads: int,
         transformer_ff_dim: int,
         dropout: float,
+        modality_dropout: float,
     ) -> None:
         super().__init__()
         self.image_backbone = image_backbone
         self.audio_backbone = audio_backbone
+        self.modality_dropout = float(max(0.0, min(1.0, modality_dropout)))
         self.image_projection = nn.Linear(feature_dim, token_dim)
         self.audio_projection = nn.Linear(feature_dim, token_dim)
         self.bottleneck_tokens = nn.Parameter(
@@ -262,6 +240,10 @@ class _MidFusionNetwork(nn.Module):
     def forward(self, image: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
         image_features = self.image_backbone(image)
         audio_features = self.audio_backbone(audio)
+        image_features, audio_features = self._apply_modality_dropout(
+            image_features,
+            audio_features,
+        )
 
         image_token = self.image_projection(image_features).unsqueeze(1)
         audio_token = self.audio_projection(audio_features).unsqueeze(1)
@@ -271,6 +253,24 @@ class _MidFusionNetwork(nn.Module):
         fused_tokens = self.transformer(tokens)
         fused_representation = fused_tokens[:, 1 : 1 + self.bottleneck_tokens.size(1)].mean(dim=1)
         return self.classifier(fused_representation)
+
+    def _apply_modality_dropout(
+        self,
+        image_features: torch.Tensor,
+        audio_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.training or self.modality_dropout <= 0.0:
+            return image_features, audio_features
+        choices = torch.rand(
+            image_features.size(0),
+            1,
+            device=image_features.device,
+            dtype=image_features.dtype,
+        )
+        half_probability = self.modality_dropout / 2.0
+        image_mask = (choices >= half_probability).to(image_features.dtype)
+        audio_mask = (choices < 1.0 - half_probability).to(audio_features.dtype)
+        return image_features * image_mask, audio_features * audio_mask
 
 
 class MidFusionModel(IModel):
@@ -309,7 +309,7 @@ class MidFusionModel(IModel):
             _MultimodalDataset(
                 train_samples,
                 self._build_image_train_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=True),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=True),
         )
@@ -319,7 +319,7 @@ class MidFusionModel(IModel):
                 _MultimodalDataset(
                     val_samples,
                     self._build_image_eval_transform(),
-                    _AudioFeatureExtractor(self.config, train_mode=False),
+                    _AudioFeatureExtractor(self.config),
                 ),
                 **self._build_dataloader_kwargs(shuffle=False),
             )
@@ -327,7 +327,7 @@ class MidFusionModel(IModel):
             _MultimodalDataset(
                 test_samples,
                 self._build_image_eval_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=False),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=False),
         )
@@ -336,7 +336,9 @@ class MidFusionModel(IModel):
             num_classes=len(self.class_to_index),
             use_pretrained=self.config.pretrained,
         ).to(self.device)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=max(0.0, min(1.0, float(self.config.label_smoothing)))
+        )
         optimizer = self._build_optimizer(self.model)
 
         self._save_json(result_root / "config_snapshot.json", asdict(self.config))
@@ -365,8 +367,16 @@ class MidFusionModel(IModel):
         self._save_json(history_path, history)
         self._save_json(summary_path, train_summary)
 
+        freeze_backbone_epochs = max(0, int(self.config.freeze_backbone_epochs))
         for epoch in range(1, self.config.epochs + 1):
-            train_metrics = self._run_epoch(train_loader, criterion, optimizer)
+            backbones_trainable = epoch > freeze_backbone_epochs
+            self._set_backbones_trainable(backbones_trainable)
+            train_metrics = self._run_epoch(
+                train_loader,
+                criterion,
+                optimizer,
+                freeze_backbones=not backbones_trainable,
+            )
             val_metrics = (
                 self._evaluate_classification_loader(val_loader, criterion)["summary"]
                 if val_loader is not None
@@ -377,6 +387,7 @@ class MidFusionModel(IModel):
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics,
+                "backbones_trainable": backbones_trainable,
             }
             history.append(history_entry)
 
@@ -463,7 +474,7 @@ class MidFusionModel(IModel):
             _MultimodalDataset(
                 inference_samples,
                 self._build_image_eval_transform(),
-                _AudioFeatureExtractor(self.config, train_mode=False),
+                _AudioFeatureExtractor(self.config),
             ),
             **self._build_dataloader_kwargs(shuffle=False),
         )
@@ -671,45 +682,37 @@ class MidFusionModel(IModel):
         return recursive_samples
 
     def _build_image_train_transform(self) -> transforms.Compose:
-        transform_steps: list[Any] = []
-        if self.config.augmentation:
-            transform_steps.append(
-                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0))
-            )
-            if self.config.horizontal_flip:
-                transform_steps.append(transforms.RandomHorizontalFlip())
-            if self.config.rotation_degrees > 0:
-                transform_steps.append(
-                    transforms.RandomRotation(self.config.rotation_degrees)
-                )
-            if self.config.color_jitter > 0:
-                jitter = self.config.color_jitter
-                transform_steps.append(
-                    transforms.ColorJitter(
-                        brightness=jitter,
-                        contrast=jitter,
-                        saturation=jitter,
-                        hue=min(jitter / 2.0, 0.5),
-                    )
-                )
-        else:
-            transform_steps.extend(
-                [
-                    transforms.Resize(self.config.resize_size),
-                    transforms.CenterCrop(self.config.image_size),
-                ]
-            )
+        if not self.config.train_augmentation:
+            return self._build_image_eval_transform()
 
-        transform_steps.extend(
+        return transforms.Compose(
             [
+                transforms.Resize(self.config.resize_size),
+                transforms.RandomResizedCrop(
+                    self.config.image_size,
+                    scale=(0.78, 1.0),
+                    ratio=(0.9, 1.1),
+                ),
+                transforms.RandomHorizontalFlip(p=0.15),
+                transforms.ColorJitter(
+                    brightness=0.12,
+                    contrast=0.12,
+                    saturation=0.08,
+                    hue=0.02,
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                 ),
+                transforms.RandomErasing(
+                    p=max(0.0, min(1.0, float(self.config.random_erasing_probability))),
+                    scale=(0.02, 0.08),
+                    ratio=(0.3, 3.3),
+                    value="random",
+                ),
             ]
         )
-        return transforms.Compose(transform_steps)
 
     def _build_image_eval_transform(self) -> transforms.Compose:
         return transforms.Compose(
@@ -725,15 +728,12 @@ class MidFusionModel(IModel):
         )
 
     def _build_feature_backbone(self, use_pretrained: bool) -> tuple[nn.Module, int]:
-        weights = None
-        if use_pretrained:
-            try:
-                weights = ViT_B_16_Weights[self.config.pretrained_weights]
-            except KeyError as error:
-                raise ValueError(
-                    f"Unsupported pretrained weights: {self.config.pretrained_weights}"
-                ) from error
-        backbone = vit_b_16(weights=weights)
+        backbone = build_vit_b_16(
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            use_pretrained=use_pretrained,
+            pretrained_weights=self.config.pretrained_weights,
+        )
         feature_dim = backbone.heads.head.in_features
         backbone.heads = nn.Identity()
         return backbone, feature_dim
@@ -754,35 +754,71 @@ class MidFusionModel(IModel):
             transformer_heads=self.config.transformer_heads,
             transformer_ff_dim=self.config.transformer_ff_dim,
             dropout=self.config.fusion_dropout,
+            modality_dropout=self.config.modality_dropout,
         )
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optimizer_name = self.config.optimizer.lower()
+        if not isinstance(model, _MidFusionNetwork):
+            raise TypeError("MidFusionModel optimizer expects a _MidFusionNetwork.")
+        backbone_params = (
+            list(model.image_backbone.parameters()) + list(model.audio_backbone.parameters())
+        )
+        fusion_params = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if not name.startswith(("image_backbone.", "audio_backbone."))
+        ]
+        parameter_groups = [
+            {
+                "params": backbone_params,
+                "lr": self.config.learning_rate
+                * max(0.0, float(self.config.backbone_lr_scale)),
+            },
+            {
+                "params": fusion_params,
+                "lr": self.config.learning_rate,
+            },
+        ]
         if optimizer_name == "adamw":
             return torch.optim.AdamW(
-                model.parameters(),
-                lr=self.config.learning_rate,
+                parameter_groups,
                 weight_decay=self.config.weight_decay,
             )
         if optimizer_name == "sgd":
             return torch.optim.SGD(
-                model.parameters(),
-                lr=self.config.learning_rate,
+                parameter_groups,
                 weight_decay=self.config.weight_decay,
                 momentum=0.9,
             )
         raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
+
+    def _set_backbones_trainable(self, trainable: bool) -> None:
+        if self.model is None:
+            return
+        for backbone in (self.model.image_backbone, self.model.audio_backbone):
+            for parameter in backbone.parameters():
+                parameter.requires_grad = trainable
+
+    def _set_backbones_eval_mode(self) -> None:
+        if self.model is None:
+            return
+        self.model.image_backbone.eval()
+        self.model.audio_backbone.eval()
 
     def _run_epoch(
         self,
         data_loader: DataLoader,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
+        freeze_backbones: bool = False,
     ) -> dict[str, float]:
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
 
         self.model.train()
+        if freeze_backbones:
+            self._set_backbones_eval_mode()
         running_loss = 0.0
         y_true: list[int] = []
         y_pred: list[int] = []
@@ -824,6 +860,7 @@ class MidFusionModel(IModel):
         running_loss = 0.0
         y_true: list[int] = []
         y_pred: list[int] = []
+        condition_labels: list[str] = []
         predictions: list[dict[str, Any]] = []
 
         with torch.no_grad():
@@ -850,8 +887,12 @@ class MidFusionModel(IModel):
                 running_loss += float(loss.item()) * image_features.size(0)
                 batch_true = labels.cpu().tolist()
                 batch_pred = predicted_indices.cpu().tolist()
+                batch_conditions = [
+                    self._condition_from_sample_id(str(sample_id)) for sample_id in sample_ids
+                ]
                 y_true.extend(batch_true)
                 y_pred.extend(batch_pred)
+                condition_labels.extend(batch_conditions)
 
                 for index, sample_id in enumerate(sample_ids):
                     predictions.append(
@@ -870,6 +911,7 @@ class MidFusionModel(IModel):
             y_true=y_true,
             y_pred=y_pred,
             average_loss=running_loss / max(len(data_loader.dataset), 1),
+            condition_labels=condition_labels,
         )
         return {"summary": summary, "predictions": predictions}
 
@@ -880,6 +922,7 @@ class MidFusionModel(IModel):
         self.model.eval()
         y_true: list[int] = []
         y_pred: list[int] = []
+        condition_labels: list[str] = []
         predictions: list[dict[str, Any]] = []
 
         with torch.no_grad():
@@ -907,6 +950,9 @@ class MidFusionModel(IModel):
                     if ground_truth_index >= 0:
                         y_true.append(ground_truth_index)
                         y_pred.append(batch_pred[index])
+                        condition_labels.append(
+                            self._condition_from_sample_id(str(sample_id))
+                        )
 
                     predictions.append(
                         self._build_prediction_record(
@@ -922,7 +968,12 @@ class MidFusionModel(IModel):
 
         summary = None
         if y_true:
-            summary = self._build_metrics_summary(y_true=y_true, y_pred=y_pred, average_loss=None)
+            summary = self._build_metrics_summary(
+                y_true=y_true,
+                y_pred=y_pred,
+                average_loss=None,
+                condition_labels=condition_labels,
+            )
         return {"summary": summary, "predictions": predictions}
 
     def _build_prediction_record(
@@ -968,6 +1019,7 @@ class MidFusionModel(IModel):
         y_true: list[int],
         y_pred: list[int],
         average_loss: float | None,
+        condition_labels: list[str] | None = None,
     ) -> dict[str, Any]:
         labels = sorted(self.index_to_class.keys())
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -977,7 +1029,7 @@ class MidFusionModel(IModel):
             zero_division=0,
         )
         display_labels = [self._display_label(label) for label in labels]
-        return {
+        summary = {
             "loss": average_loss,
             "accuracy": float(accuracy_score(y_true, y_pred)),
             "macro_precision": float(precision),
@@ -994,6 +1046,55 @@ class MidFusionModel(IModel):
                 zero_division=0,
             ),
         }
+        if condition_labels:
+            summary["condition_metrics"] = self._build_condition_metrics(
+                y_true,
+                y_pred,
+                condition_labels,
+            )
+        return summary
+
+    def _condition_from_sample_id(self, sample_id: str) -> str:
+        wrapped = f"_{sample_id}_"
+        for condition in (
+            "clean_sanity",
+            "audio_hard",
+            "image_hard",
+            "both_hard",
+            "balanced",
+            "train",
+        ):
+            if f"_{condition}_" in wrapped:
+                return condition
+        return "unknown"
+
+    def _build_condition_metrics(
+        self,
+        y_true: list[int],
+        y_pred: list[int],
+        condition_labels: list[str],
+    ) -> dict[str, dict[str, float | int]]:
+        metrics: dict[str, dict[str, float | int]] = {}
+        for condition in sorted(set(condition_labels)):
+            indices = [
+                index for index, label in enumerate(condition_labels) if label == condition
+            ]
+            if not indices:
+                continue
+            condition_true = [y_true[index] for index in indices]
+            condition_pred = [y_pred[index] for index in indices]
+            _, _, f1, _ = precision_recall_fscore_support(
+                condition_true,
+                condition_pred,
+                average="macro",
+                zero_division=0,
+            )
+            metrics[condition] = {
+                "support": len(indices),
+                "accuracy": float(accuracy_score(condition_true, condition_pred)),
+                "macro_f1": float(f1),
+            }
+        return metrics
 
     def _display_label(self, label_index: int) -> str:
         class_name = self.index_to_class.get(label_index, str(label_index))

@@ -1,18 +1,15 @@
 {
   "AudioModel": {
     "model_name": "ast_vit_b_16",
-    "pretrained": true,
+    "pretrained": false,
     "pretrained_weights": "IMAGENET1K_V1",
-    "batch_size": 48,
+    "batch_size": 32,
     "num_workers": 8,
-    "learning_rate": 0.00001,
+    "learning_rate": 0.00003,
     "weight_decay": 0.05,
     "epochs": 30,
     "dropout": 0.1,
-    "label_smoothing": 0.05,
-    "freeze_backbone_epochs": 2,
-    "backbone_lr_scale": 0.2,
-    "early_stopping_patience": 5,
+    "early_stopping_patience": 8,
     "optimizer": "adamw",
     "seed": 42,
     "device": "cuda",
@@ -26,7 +23,6 @@
     "n_mels": 128,
     "f_min": 20.0,
     "f_max": 11025.0,
-    "image_size": 128,
-    "patch_size": 16
+    "image_size": 224
   }
 }

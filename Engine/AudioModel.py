@@ -38,6 +38,9 @@ class _AudioModelConfig:
     weight_decay: float = 1e-4
     epochs: int = 10
     dropout: float = 0.0
+    label_smoothing: float = 0.0
+    freeze_backbone_epochs: int = 0
+    backbone_lr_scale: float = 1.0
     early_stopping_patience: int = 5
     optimizer: str = "adamw"
     seed: int = 42
@@ -244,7 +247,9 @@ class AudioModel(IModel):
             num_classes=len(self.class_to_index),
             use_pretrained=self.config.pretrained,
         ).to(self.device)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=max(0.0, min(1.0, float(self.config.label_smoothing)))
+        )
         optimizer = self._build_optimizer(self.model)
 
         self._save_json(result_root / "config_snapshot.json", asdict(self.config))
@@ -273,8 +278,16 @@ class AudioModel(IModel):
         self._save_json(history_path, history)
         self._save_json(summary_path, train_summary)
 
+        freeze_backbone_epochs = max(0, int(self.config.freeze_backbone_epochs))
         for epoch in range(1, self.config.epochs + 1):
-            train_metrics = self._run_epoch(train_loader, criterion, optimizer)
+            backbone_trainable = epoch > freeze_backbone_epochs
+            self._set_backbone_trainable(self.model, backbone_trainable)
+            train_metrics = self._run_epoch(
+                train_loader,
+                criterion,
+                optimizer,
+                freeze_backbone=not backbone_trainable,
+            )
             val_metrics = (
                 self._evaluate_classification_loader(val_loader, criterion)["summary"]
                 if val_loader is not None
@@ -285,6 +298,7 @@ class AudioModel(IModel):
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics,
+                "backbone_trainable": backbone_trainable,
             }
             history.append(history_entry)
 
@@ -602,31 +616,70 @@ class AudioModel(IModel):
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optimizer_name = self.config.optimizer.lower()
+        backbone_params, head_params = self._split_backbone_head_parameters(model)
+        parameter_groups = [
+            {
+                "params": backbone_params,
+                "lr": self.config.learning_rate
+                * max(0.0, float(self.config.backbone_lr_scale)),
+            },
+            {
+                "params": head_params,
+                "lr": self.config.learning_rate,
+            },
+        ]
         if optimizer_name == "adamw":
             return torch.optim.AdamW(
-                model.parameters(),
-                lr=self.config.learning_rate,
+                parameter_groups,
                 weight_decay=self.config.weight_decay,
             )
         if optimizer_name == "sgd":
             return torch.optim.SGD(
-                model.parameters(),
-                lr=self.config.learning_rate,
+                parameter_groups,
                 weight_decay=self.config.weight_decay,
                 momentum=0.9,
             )
         raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
+
+    def _split_backbone_head_parameters(
+        self, model: nn.Module
+    ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        backbone_params: list[nn.Parameter] = []
+        head_params: list[nn.Parameter] = []
+        for name, parameter in model.named_parameters():
+            if name.startswith("heads.head."):
+                head_params.append(parameter)
+            else:
+                backbone_params.append(parameter)
+        return backbone_params, head_params
+
+    def _set_backbone_trainable(self, model: nn.Module | None, trainable: bool) -> None:
+        if model is None:
+            return
+        for name, parameter in model.named_parameters():
+            if not name.startswith("heads.head."):
+                parameter.requires_grad = trainable
+
+    def _set_backbone_eval_mode(self) -> None:
+        if self.model is None:
+            return
+        for name, module in self.model.named_children():
+            if name != "heads":
+                module.eval()
 
     def _run_epoch(
         self,
         data_loader: DataLoader,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
+        freeze_backbone: bool = False,
     ) -> dict[str, float]:
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
 
         self.model.train()
+        if freeze_backbone:
+            self._set_backbone_eval_mode()
         running_loss = 0.0
         y_true: list[int] = []
         y_pred: list[int] = []
@@ -667,6 +720,7 @@ class AudioModel(IModel):
         running_loss = 0.0
         y_true: list[int] = []
         y_pred: list[int] = []
+        condition_labels: list[str] = []
         predictions: list[dict[str, Any]] = []
 
         with torch.no_grad():
@@ -684,8 +738,12 @@ class AudioModel(IModel):
                 running_loss += float(loss.item()) * features.size(0)
                 batch_true = labels.cpu().tolist()
                 batch_pred = predicted_indices.cpu().tolist()
+                batch_conditions = [
+                    self._condition_from_sample_id(str(sample_id)) for sample_id in sample_ids
+                ]
                 y_true.extend(batch_true)
                 y_pred.extend(batch_pred)
+                condition_labels.extend(batch_conditions)
 
                 for index, sample_id in enumerate(sample_ids):
                     predictions.append(
@@ -703,6 +761,7 @@ class AudioModel(IModel):
             y_true=y_true,
             y_pred=y_pred,
             average_loss=running_loss / max(len(data_loader.dataset), 1),
+            condition_labels=condition_labels,
         )
         return {"summary": summary, "predictions": predictions}
 
@@ -713,6 +772,7 @@ class AudioModel(IModel):
         self.model.eval()
         y_true: list[int] = []
         y_pred: list[int] = []
+        condition_labels: list[str] = []
         predictions: list[dict[str, Any]] = []
 
         with torch.no_grad():
@@ -731,6 +791,9 @@ class AudioModel(IModel):
                     if ground_truth_index >= 0:
                         y_true.append(ground_truth_index)
                         y_pred.append(batch_pred[index])
+                        condition_labels.append(
+                            self._condition_from_sample_id(str(sample_id))
+                        )
 
                     predictions.append(
                         self._build_prediction_record(
@@ -745,7 +808,12 @@ class AudioModel(IModel):
 
         summary = None
         if y_true:
-            summary = self._build_metrics_summary(y_true=y_true, y_pred=y_pred, average_loss=None)
+            summary = self._build_metrics_summary(
+                y_true=y_true,
+                y_pred=y_pred,
+                average_loss=None,
+                condition_labels=condition_labels,
+            )
         return {"summary": summary, "predictions": predictions}
 
     def _build_prediction_record(
@@ -789,6 +857,7 @@ class AudioModel(IModel):
         y_true: list[int],
         y_pred: list[int],
         average_loss: float | None,
+        condition_labels: list[str] | None = None,
     ) -> dict[str, Any]:
         labels = sorted(self.index_to_class.keys())
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -798,7 +867,7 @@ class AudioModel(IModel):
             zero_division=0,
         )
         display_labels = [self._display_label(label) for label in labels]
-        return {
+        summary = {
             "loss": average_loss,
             "accuracy": float(accuracy_score(y_true, y_pred)),
             "macro_precision": float(precision),
@@ -815,6 +884,55 @@ class AudioModel(IModel):
                 zero_division=0,
             ),
         }
+        if condition_labels:
+            summary["condition_metrics"] = self._build_condition_metrics(
+                y_true,
+                y_pred,
+                condition_labels,
+            )
+        return summary
+
+    def _condition_from_sample_id(self, sample_id: str) -> str:
+        wrapped = f"_{sample_id}_"
+        for condition in (
+            "clean_sanity",
+            "audio_hard",
+            "image_hard",
+            "both_hard",
+            "balanced",
+            "train",
+        ):
+            if f"_{condition}_" in wrapped:
+                return condition
+        return "unknown"
+
+    def _build_condition_metrics(
+        self,
+        y_true: list[int],
+        y_pred: list[int],
+        condition_labels: list[str],
+    ) -> dict[str, dict[str, float | int]]:
+        metrics: dict[str, dict[str, float | int]] = {}
+        for condition in sorted(set(condition_labels)):
+            indices = [
+                index for index, label in enumerate(condition_labels) if label == condition
+            ]
+            if not indices:
+                continue
+            condition_true = [y_true[index] for index in indices]
+            condition_pred = [y_pred[index] for index in indices]
+            _, _, f1, _ = precision_recall_fscore_support(
+                condition_true,
+                condition_pred,
+                average="macro",
+                zero_division=0,
+            )
+            metrics[condition] = {
+                "support": len(indices),
+                "accuracy": float(accuracy_score(condition_true, condition_pred)),
+                "macro_f1": float(f1),
+            }
+        return metrics
 
     def _display_label(self, label_index: int) -> str:
         class_name = self.index_to_class.get(label_index, str(label_index))
