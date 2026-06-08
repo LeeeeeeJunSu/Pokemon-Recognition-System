@@ -23,8 +23,10 @@ from torchvision.models import ViT_B_16_Weights, vit_b_16
 
 try:
     from .IModel import IModel, PathLike
+    from .VisionTransformerFactory import build_vit_b_16
 except ImportError:
     from IModel import IModel, PathLike
+    from VisionTransformerFactory import build_vit_b_16
 
 
 @dataclass
@@ -33,6 +35,7 @@ class _AudioModelConfig:
     pretrained: bool = False
     pretrained_weights: str = "IMAGENET1K_V1"
     batch_size: int = 16
+    patch_size: int = 16
     num_workers: int = 0
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
@@ -606,7 +609,12 @@ class AudioModel(IModel):
                     f"Unsupported pretrained weights: {self.config.pretrained_weights}"
                 ) from error
 
-        model = vit_b_16(weights=weights)
+        model = build_vit_b_16(
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            use_pretrained=use_pretrained,
+            pretrained_weights=self.config.pretrained_weights,
+        )
         in_features = model.heads.head.in_features
         model.heads.head = nn.Sequential(
             nn.Dropout(self.config.dropout),
