@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -177,6 +180,7 @@ class InferenceWorker(QThread):
             self.progress_changed.emit(self.run_info.run_id, "체크포인트를 로드하는 중입니다.")
             model = MODEL_REGISTRY[self.run_info.model_name]()
             model.Load(self.run_info.checkpoint_path)
+            self._configure_file_inference_runtime(model)
 
             self.progress_changed.emit(self.run_info.run_id, "파일 기반 추론을 실행하는 중입니다.")
             model.Inference(input_root, self.run_info.result_root)
@@ -218,6 +222,11 @@ class InferenceWorker(QThread):
         _write_json(input_root / "meta.json", meta)
         return input_root
 
+    def _configure_file_inference_runtime(self, model: Any) -> None:
+        config = getattr(model, "config", None)
+        if config is not None and hasattr(config, "num_workers"):
+            config.num_workers = 0
+
     def _prepare_image_file(self, src: Path, dst: Path) -> None:
         with Image.open(src) as image:
             image = image.convert("RGB")
@@ -232,8 +241,56 @@ class InferenceWorker(QThread):
         except Exception:
             pass
 
-        waveform, sample_rate = torchaudio.load(str(src))
-        torchaudio.save(str(dst), waveform, sample_rate)
+        try:
+            waveform, sample_rate = torchaudio.load(str(src))
+            torchaudio.save(str(dst), waveform, sample_rate)
+            return
+        except Exception as torchaudio_error:
+            ffmpeg_path = self._find_ffmpeg_executable()
+            if ffmpeg_path is None:
+                raise RuntimeError(
+                    f"오디오 파일을 WAV로 변환할 수 없습니다: {src}\n"
+                    "WAV/FLAC/OGG처럼 libsndfile이 읽을 수 있는 파일을 사용하거나, "
+                    "`pip install imageio-ffmpeg` 또는 시스템 ffmpeg 설치가 필요합니다."
+                ) from torchaudio_error
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(src),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "22050",
+                "-sample_fmt",
+                "s16",
+                str(dst),
+            ]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as ffmpeg_error:
+                stderr = (ffmpeg_error.stderr or "").strip()
+                raise RuntimeError(
+                    f"ffmpeg로 오디오 파일을 변환하지 못했습니다: {src}\n{stderr}"
+                ) from ffmpeg_error
+
+    def _find_ffmpeg_executable(self) -> str | None:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            return ffmpeg_path
+
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            return None
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
 
     def _load_result_payload(self) -> dict[str, Any]:
         summary = _read_json(self.run_info.result_root / "logs" / "inference_summary.json") or {}
@@ -254,10 +311,11 @@ class FileTestWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Pokemon Recognition File Tester")
-        self.resize(1500, 930)
+        self.resize(1280, 820)
 
         self.default_result_base = PROJECT_ROOT / "artifacts" / "file_test_runs"
         self.active_worker: InferenceWorker | None = None
+        self.close_after_worker = False
         self.current_run_id: str | None = None
         self.selected_run_id: str | None = None
         self.runs: list[InferenceRun] = []
@@ -454,7 +512,11 @@ class FileTestWindow(QMainWindow):
         splitter.setSizes([630, 830])
         root_layout.addWidget(splitter, 1)
 
-        self.setCentralWidget(central)
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumSize(980, 680)
+        scroll_area.setWidget(central)
+        self.setCentralWidget(scroll_area)
 
     def _apply_styles(self) -> None:
         self.setFont(QFont("Segoe UI", 10))
@@ -689,6 +751,7 @@ class FileTestWindow(QMainWindow):
         self.active_worker = InferenceWorker(run)
         self.active_worker.progress_changed.connect(self._on_worker_progress)
         self.active_worker.finished_run.connect(self._on_worker_finished)
+        self.active_worker.finished.connect(self._on_worker_thread_finished)
         self.active_worker.start()
 
     def _on_worker_progress(self, run_id: str, message: str) -> None:
@@ -720,14 +783,20 @@ class FileTestWindow(QMainWindow):
         else:
             self._append_log(f"{run.run_id} | 완료 | {run.predicted_label}")
 
-        if self.active_worker is not None:
-            self.active_worker.deleteLater()
-            self.active_worker = None
         self.current_run_id = None
 
         self._refresh_run_table()
         self._refresh_status_card(self._find_run(self.selected_run_id))
         self._refresh_result_panel()
+
+    def _on_worker_thread_finished(self) -> None:
+        worker = self.sender()
+        if worker is self.active_worker:
+            self.active_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self.close_after_worker:
+            self.close()
 
     def _refresh_status_card(self, run: InferenceRun | None) -> None:
         if run is None:
@@ -874,13 +943,17 @@ class FileTestWindow(QMainWindow):
             response = QMessageBox.question(
                 self,
                 "추론 진행 중",
-                "지금 닫으면 진행 중인 추론이 중단될 수 있습니다. 정말 닫을까요?",
+                "진행 중인 추론이 끝난 뒤 창을 닫을까요?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if response != QMessageBox.Yes:
                 event.ignore()
                 return
+            self.close_after_worker = True
+            self.message_label.setText("추론이 끝나는 대로 창을 닫습니다.")
+            event.ignore()
+            return
         event.accept()
 
 

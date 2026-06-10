@@ -439,7 +439,10 @@ class MidFusionModel(IModel):
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Network file not found: {checkpoint_path}")
 
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
         checkpoint_config = checkpoint.get("config", {})
         self.config = _MidFusionConfig.from_mapping(checkpoint_config)
         self.device = self._resolve_device(self.config.device)
